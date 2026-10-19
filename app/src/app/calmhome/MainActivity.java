@@ -19,11 +19,13 @@ import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.content.res.Configuration;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -38,9 +40,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -66,11 +66,9 @@ public class MainActivity extends Activity {
     private static final int DIM = 0xFF8B949E;
     private static final int ACCENT = 0xFF58A6FF;
 
-    private static final int TILE_W = 200;   // dp, outer width of a tile
-    private static final int IMG_W = 188;    // dp, artwork width
-    private static final int IMG_H = 106;    // dp, artwork height (about 16:9)
+    private static final int SCREEN_MARGIN_DP = 56;   // TV overscan-safe side margin
 
-    private static class Item {
+    private static class Item implements Order.Entry {
         String key;
         String label;
         String badge;      // text shown instead of artwork (HDMI, Settings...)
@@ -78,6 +76,9 @@ public class MainActivity extends Activity {
         boolean banner;    // true: art fills the card; false: art is a centred icon
         boolean input;
         Intent intent;
+
+        @Override public String key() { return key; }
+        @Override public String label() { return label; }
     }
 
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -86,6 +87,7 @@ public class MainActivity extends Activity {
     private ScrollView scroll;
     private float dp;
     private int generation;
+    private Grid grid;
 
     private View firstTile;
     private final Map<String, View> tileByKey = new HashMap<String, View>();
@@ -105,7 +107,7 @@ public class MainActivity extends Activity {
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
         // TV overscan-safe margins.
-        column.setPadding(px(56), px(28), px(56), 0);
+        column.setPadding(px(SCREEN_MARGIN_DP), px(28), px(SCREEN_MARGIN_DP), 0);
         column.addView(buildHeader());
 
         scroll = new ScrollView(this);
@@ -139,6 +141,13 @@ public class MainActivity extends Activity {
         // Home pressed while already on the home screen: jump back to the top.
         scroll.scrollTo(0, 0);
         if (firstTile != null) firstTile.requestFocus();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        dp = getResources().getDisplayMetrics().density;
+        reload();
     }
 
     @Override
@@ -194,7 +203,7 @@ public class MainActivity extends Activity {
                 final List<Item> all = loadAll();
                 ui.post(new Runnable() {
                     @Override public void run() {
-                        if (mine == generation && !isFinishing()) render(all);
+                        if (mine == generation && !isFinishing() && !isDestroyed()) render(all);
                     }
                 });
             }
@@ -211,7 +220,7 @@ public class MainActivity extends Activity {
                     // HDMI ports only; skip CEC child devices (they have a parent).
                     if (info.getType() != TvInputInfo.TYPE_HDMI) continue;
                     if (info.getParentId() != null) continue;
-                    CharSequence label = info.loadCustomLabel(this);
+                    CharSequence label = customLabel(info);
                     if (label == null || label.length() == 0) label = info.loadLabel(this);
                     Item it = new Item();
                     it.key = "in:" + info.getId();
@@ -257,6 +266,17 @@ public class MainActivity extends Activity {
         return out;
     }
 
+    /** The name the user gave an input (e.g. "Game console"); the API only exists on newer TVs. */
+    private CharSequence customLabel(TvInputInfo info) {
+        if (Build.VERSION.SDK_INT < 26) return null;
+        try {
+            return (CharSequence) TvInputInfo.class
+                    .getMethod("loadCustomLabel", Context.class).invoke(info, this);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     // --------------------------------------------------------------- rendering
 
     private void render(List<Item> all) {
@@ -268,9 +288,7 @@ public class MainActivity extends Activity {
 
         Set<String> hidden = new HashSet<String>(
                 prefs.getStringSet("hidden", new HashSet<String>()));
-        final List<String> pins = new ArrayList<String>(
-                Arrays.asList(prefs.getString("pins", "").split(",")));
-        pins.remove("");
+        final List<String> pins = Order.parsePins(prefs.getString("pins", ""));
 
         List<Item> inputs = new ArrayList<Item>();
         List<Item> apps = new ArrayList<Item>();
@@ -281,21 +299,12 @@ public class MainActivity extends Activity {
             else apps.add(it);
         }
 
-        Collections.sort(apps, new Comparator<Item>() {
-            @Override public int compare(Item a, Item b) {
-                int pa = pins.indexOf(a.key), pb = pins.indexOf(b.key);
-                if (pa < 0) pa = Integer.MAX_VALUE;
-                if (pb < 0) pb = Integer.MAX_VALUE;
-                if (pa != pb) return pa < pb ? -1 : 1;
-                int na = prefs.getInt("n:" + a.key, 0), nb = prefs.getInt("n:" + b.key, 0);
-                if (na != nb) return na > nb ? -1 : 1;
-                return a.label.compareToIgnoreCase(b.label);
-            }
-        });
-        Collections.sort(inputs, new Comparator<Item>() {
-            @Override public int compare(Item a, Item b) {
-                return a.label.compareToIgnoreCase(b.label);
-            }
+        Order.Counter counts = new Order.Counter() {
+            @Override public int launches(String key) { return prefs.getInt("n:" + key, 0); }
+        };
+        Order.sort(apps, pins, counts);
+        Order.sort(inputs, Collections.<String>emptyList(), new Order.Counter() {
+            @Override public int launches(String key) { return 0; }
         });
 
         // Always-available system tiles go last.
@@ -314,8 +323,9 @@ public class MainActivity extends Activity {
             apps.add(h);
         }
 
-        int usable = getResources().getDisplayMetrics().widthPixels - px(112);
-        int cols = Math.max(3, usable / px(TILE_W + 20));
+        int contentWidth = getResources().getDisplayMetrics().widthPixels - 2 * px(SCREEN_MARGIN_DP);
+        grid = Grid.compute(contentWidth, dp);
+        int cols = grid.cols;
 
         content.removeAllViews();
         tileByKey.clear();
@@ -336,7 +346,7 @@ public class MainActivity extends Activity {
         TextView t = new TextView(this);
         t.setText(title.toUpperCase());
         t.setTextColor(DIM);
-        t.setTextSize(13);
+        t.setTextSize(14);
         t.setLetterSpacing(0.12f);
         t.setPadding(px(10), px(18), 0, px(6));
         content.addView(t);
@@ -364,7 +374,7 @@ public class MainActivity extends Activity {
         tile.setClickable(true);
         tile.setLongClickable(true);
         tile.setTag(it);
-        tile.setPadding(px(6), px(6), px(6), px(6));
+        tile.setPadding(px(Grid.PAD_DP), px(Grid.PAD_DP), px(Grid.PAD_DP), px(Grid.PAD_DP));
         tile.setBackground(focusBackground());
 
         FrameLayout art = new FrameLayout(this);
@@ -378,7 +388,7 @@ public class MainActivity extends Activity {
                 iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
             } else {
                 iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                iv.setPadding(px(30), px(18), px(30), px(18));
+                iv.setPadding(px(22), px(12), px(22), px(12));
             }
             art.addView(iv, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -393,7 +403,7 @@ public class MainActivity extends Activity {
             art.addView(badge, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         }
-        tile.addView(art, new LinearLayout.LayoutParams(px(IMG_W), px(IMG_H)));
+        tile.addView(art, new LinearLayout.LayoutParams(grid.artW, grid.artH));
 
         TextView label = new TextView(this);
         label.setText(it.label);
@@ -421,8 +431,9 @@ public class MainActivity extends Activity {
         });
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                px(TILE_W), ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(px(5), px(5), px(5), px(5));
+                grid.tileW, ViewGroup.LayoutParams.WRAP_CONTENT);
+        int m = px(Grid.MARGIN_DP);
+        lp.setMargins(m, m, m, m);
         tile.setLayoutParams(lp);
         tileByKey.put(it.key, tile);
         return tile;
@@ -476,12 +487,8 @@ public class MainActivity extends Activity {
     }
 
     private void pin(String key) {
-        List<String> pins = new ArrayList<String>(
-                Arrays.asList(prefs.getString("pins", "").split(",")));
-        pins.remove("");
-        pins.remove(key);
-        pins.add(0, key);
-        prefs.edit().putString("pins", TextUtils.join(",", pins)).apply();
+        List<String> pins = Order.moveToFront(Order.parsePins(prefs.getString("pins", "")), key);
+        prefs.edit().putString("pins", Order.joinPins(pins)).apply();
         reload();
     }
 

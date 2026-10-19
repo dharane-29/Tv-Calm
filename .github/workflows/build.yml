@@ -2,7 +2,10 @@ name: build-apk
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest   # ships with the Android SDK; ANDROID_HOME is preset
@@ -12,8 +15,12 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - run: python3 tvcalm.py build
+      - name: Tests (Java unit tests, Python tests against a simulated TV, real APK build check)
+        run: python3 tests/run_all.py
+      - name: Build APK
+        run: python3 tvcalm.py build
       - uses: actions/upload-artifact@v4
         with:
           name: calmhome
           path: out/
+          if-no-files-found: error

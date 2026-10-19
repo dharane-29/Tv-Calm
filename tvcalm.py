@@ -12,6 +12,7 @@ Needs `adb` (Android platform-tools) on your PATH or in ANDROID_HOME.
   python tvcalm.py restore  <tv-ip>            revert every recorded change
   python tvcalm.py undo     <tv-ip>            stock home screen back, launcher removed
   python tvcalm.py lockdown <tv-ip>            turn debugging off when you're done
+  python tests/run_all.py                      run every test (needs JDK for the Java tests)
 
 Safety model
   * Nothing is ever uninstalled. Apps are disabled with `pm disable-user`.
@@ -60,7 +61,18 @@ PROTECT_PREFIX = (
     "com.google.android.tv.remote",       # remote / Bluetooth pairing
     "com.google.android.tvremote",
     "com.google.android.bluetooth",
+    # chipset / board vendor services: low-level, never safe to guess about
+    "com.mediatek.", "com.qualcomm.", "com.qti.", "org.codeaurora.", "com.amlogic.",
+    "com.droidlogic.", "com.rockchip.", "com.realtek.", "com.broadcom.", "com.nvidia.",
+    "com.hisilicon.", "com.sprd.", "vendor.",
 )
+# Anything whose NAME says it deals with setup, connectivity, input, storage or security.
+PROTECT_RE = re.compile(
+    r"setup|provision|oobe|wizard|bluetooth|wifi|wlan|ethernet|dhcp|systemui|keychain|"
+    r"certinstaller|inputdevices|settings|telephony|dialer|\bcec\b|hdmi|tvinput|tuner|"
+    r"mediaprovider|documentsui|externalstorage|packageinstaller|permission|nfc|usb|"
+    r"networkstack|captiveportal|emergency|bugreport|overlay|webview|trichrome", re.I)
+ROLES = ("HOME", "ASSISTANT", "DIALER", "SMS", "BROWSER", "EMERGENCY")
 # Offered, but flagged: disabling these changes visible behaviour.
 CAUTION_EXACT = {
     "com.google.android.katniss",          # voice search / Assistant
@@ -128,8 +140,12 @@ def find_adb() -> str:
 class TV:
     def __init__(self, target: str):
         self.adb = find_adb()
-        self.serial = target + ":5555" if re.fullmatch(r"\d+(\.\d+){3}", target) else target
-        if ":" in self.serial:
+        known = {l.split()[0] for l in run([self.adb, "devices"], 20)[1].splitlines()[1:] if l.strip()}
+        if target in known or ":" in target or target.startswith("emulator-"):
+            self.serial = target
+        else:
+            self.serial = target + ":5555"       # bare IP or hostname: default adb port
+        if self.serial not in known and not self.serial.startswith("emulator-"):
             run([self.adb, "connect", self.serial], 20)
         rc, out, err = run([self.adb, "-s", self.serial, "get-state"], 20)
         if "unauthorized" in out + err:
@@ -201,21 +217,38 @@ def protected_dynamic(tv: TV) -> set:
         prot.add(cur.split("/")[0])
     out = tv.sh("cmd package query-services --brief -a android.media.tv.TvInputService")
     prot |= set(re.findall(r"([A-Za-z0-9_.]+)/[A-Za-z0-9_.$]+", out))
+    for role in ROLES:   # best effort: only exists on Android 10+
+        held = tv.sh(f"cmd role get-role-holders --user 0 android.app.role.{role}")
+        prot |= set(re.findall(r"^[A-Za-z][A-Za-z0-9_.]*$", held, re.M))
     return prot
 
 
 def is_protected(pkg: str, dyn: set) -> bool:
-    return pkg in PROTECT_EXACT or pkg in dyn or pkg.startswith(PROTECT_PREFIX)
+    return (pkg in PROTECT_EXACT or pkg in dyn or pkg.startswith(PROTECT_PREFIX)
+            or bool(PROTECT_RE.search(pkg)))
 
 
 def home_candidates(tv: TV) -> list:
-    out = tv.sh(HOME_Q)
-    return sorted({l.split("/")[0].strip() for l in out.splitlines() if "/" in l})
+    for cmd in (HOME_Q, HOME_Q.replace("cmd package", "pm", 1)):
+        out = tv.sh(cmd)
+        found = sorted({l.split("/")[0].strip() for l in out.splitlines()
+                        if "/" in l and re.fullmatch(r"[A-Za-z0-9_.]+/\S+", l.strip())})
+        if found:
+            return found
+    return []
 
 
 def current_home(tv: TV) -> str:
-    lines = [l.strip() for l in tv.sh(HOME_R).splitlines() if "/" in l]
-    return lines[-1] if lines else ""
+    for cmd in (HOME_R, HOME_R.replace("cmd package", "pm", 1)):
+        lines = [l.strip() for l in tv.sh(cmd).splitlines()
+                 if re.fullmatch(r"[A-Za-z0-9_.]+/\S+", l.strip())]
+        if lines:
+            return lines[-1]
+    return ""
+
+
+def is_ours(component: str) -> bool:
+    return component.split("/")[0] == PKG
 
 
 def healthy(tv: TV):
@@ -360,7 +393,11 @@ def cmd_debloat(a):
     print(f"\nSnapshot saved: {path}")
     done = disable_all(tv, chosen)
     snap["disabled"] = done
+    if not done:
+        snap["reverted"] = True
     snap_save(path, snap)
+    if not done:
+        die("Nothing could be disabled (the TV refused every request). No changes were made.")
 
     ok, why = healthy(tv)
     if not ok:
@@ -408,15 +445,28 @@ def cmd_tune(a):
         print("\nRe-run with --apply to make these changes.")
         return
     path, snap = snap_new(tv, "tune", settings=entries)
+    unchanged = []
     for e in entries:
         tv.put_setting(e["ns"], e["key"], e["new"])
+        now = tv.get_setting(e["ns"], e["key"])
+        if now is None or (now != e["new"] and not _same_number(now, e["new"])):
+            unchanged.append(f'{e["ns"]}.{e["key"]}')
     print(f"\nApplied. Snapshot: {path}\nUndo: python tvcalm.py restore {a.target}")
+    if unchanged:
+        print("These didn't stick (this TV ignores or overrides them): " + ", ".join(unchanged))
+
+
+def _same_number(a: str, b: str) -> bool:
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except ValueError:
+        return False
 
 
 def set_default_home(tv: TV):
     if int(tv.prop("ro.build.version.sdk") or 0) >= 29:
         tv.sh(f"cmd role add-role-holder --user 0 android.app.role.HOME {PKG}")
-    tv.sh(f"cmd package set-home-activity {ACT}")
+    tv.sh(f"cmd package set-home-activity {ACT} || pm set-home-activity {ACT}")
 
 
 def cmd_install(a):
@@ -448,10 +498,13 @@ def cmd_install(a):
         die("Install failed: " + (err or out) + "\nIf the TV shows a Play Protect prompt, allow it and retry.")
     print("Installed.")
 
-    if PKG not in home_candidates(tv):
+    cands = home_candidates(tv)
+    if cands and PKG not in cands:
         die("Installed, but the TV doesn't list it as a home screen.")
+    if not cands:
+        print("note: this TV can't list home screens from the shell; trying anyway.")
     set_default_home(tv)
-    if current_home(tv) != ACT:
+    if not is_ours(current_home(tv)):
         stock = [p for p in home_candidates(tv) if p != PKG and not LAUNCHER_NEVER.search(p)]
         if not stock:
             print("The TV still opens its own home screen and none can be safely disabled.")
@@ -462,13 +515,13 @@ def cmd_install(a):
                 snap["disabled"] = disable_all(tv, stock)
                 snap_save(path, snap)
                 set_default_home(tv)
-                if current_home(tv) != ACT:
+                if not is_ours(current_home(tv)):
                     print("Still not taking over. Reverting so nothing is left broken.")
                     revert(tv, snap)
                     snap["reverted"] = True
                     snap_save(path, snap)
     tv.sh("input keyevent KEYCODE_HOME")
-    if current_home(tv) == ACT:
+    if is_ours(current_home(tv)):
         print("Done. Press Home on your remote.")
     else:
         print("Installed, but the TV still opens its own home. If it asks which home screen "
@@ -575,14 +628,17 @@ def cmd_build(a):
     out.mkdir(exist_ok=True)
 
     sources = [str(p) for p in (ROOT / "app" / "src").rglob("*.java")]
-    _step(["javac", "--release", "8", "-Xlint:-options", "-classpath", jar,
-           "-d", work / "classes", *sources])
+    javac = ["javac", "-Xlint:-options", "-classpath", jar, "-d", work / "classes", *sources]
+    rc, _, _ = run([str(c) for c in ["javac", "--release", "8", "-version"]], 30)
+    _step(javac[:1] + (["--release", "8"] if rc == 0 else ["-source", "8", "-target", "8"]) + javac[1:])
     classes = [str(p) for p in (work / "classes").rglob("*.class")]
     _step([_tool(bt, "d8"), "--release", "--min-api", "21", "--lib", jar,
            "--output", work / "dex", *classes])
-    base = work / "base.apk"
-    _step([_tool(bt, "aapt2"), "link", "-o", base, "--manifest", ROOT / "app" / "AndroidManifest.xml",
-           "-I", jar])
+    base, res_zip = work / "base.apk", work / "res.zip"
+    aapt2 = _tool(bt, "aapt2")
+    _step([aapt2, "compile", "--dir", ROOT / "app" / "res", "-o", res_zip])
+    _step([aapt2, "link", "-o", base, "--manifest", ROOT / "app" / "AndroidManifest.xml",
+           "-I", jar, "-R", res_zip, "--auto-add-overlay"])
     with zipfile.ZipFile(base, "a") as z:
         z.write(work / "dex" / "classes.dex", "classes.dex")
     aligned = work / "aligned.apk"
@@ -601,8 +657,10 @@ def cmd_build(a):
                "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
                "-alias", "calmhome", "-dname", "CN=Calm Home"])
     final = out / "calmhome.apk"
+    for stale in out.glob("calmhome.apk*"):
+        stale.unlink()
     _step([_tool(bt, "apksigner"), "sign", "--ks", ks, "--ks-pass", f"file:{pw}",
-           "--out", final, aligned])
+           "--v4-signing-enabled", "false", "--out", final, aligned])
     _step([_tool(bt, "apksigner"), "verify", final])
     digest = sha256(final)
     (out / "calmhome.apk.sha256").write_text(f"{digest}  calmhome.apk\n")
