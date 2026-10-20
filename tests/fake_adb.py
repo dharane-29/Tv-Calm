@@ -2,6 +2,14 @@
 """A tiny simulated `adb` + Android TV, driven by a JSON state file ($FAKE_ADB_STATE)."""
 import json, os, sys
 
+if os.environ.get("FAKE_ADB_CRLF"):
+    # Real adb on Windows ends every output line with \r\n. Simulate that.
+    _real_print = print
+
+    def print(*args, **kw):  # noqa: A001
+        text = " ".join(str(a) for a in args).replace("\n", "\r\n")
+        _real_print(text, end=kw.get("end", "\r\n"), file=kw.get("file", sys.stdout))
+
 S = os.environ["FAKE_ADB_STATE"]
 DEFAULT = {
     "system": ["android", "com.android.settings", "com.android.vending", "com.google.android.gms",
@@ -60,7 +68,8 @@ def current_home():
 
 
 if a[0] == "devices":
-    out("List of devices attached", *([] if st["scenario"]["adb_off"] else ["192.168.1.50:5555\tdevice"]))
+    serial = os.environ.get("FAKE_ADB_SERIAL", "192.168.1.50:5555")
+    out("List of devices attached", *([] if st["scenario"]["adb_off"] else [serial + "\tdevice"]))
     sys.exit(0)
 if a[0] == "connect":
     if sc["adb_off"]:
@@ -94,12 +103,44 @@ if a[0] == "push":
     if sc.get("push_all_fail"):
         print("adb: error: failed to copy", file=sys.stderr); sys.exit(1)
     files[a[2]] = "pushed:" + os.path.basename(a[1]); save(); print("1 file pushed"); sys.exit(0)
+if a[0] == "logcat":
+    if "-d" in a:
+        print("10-20 12:00:00.000  100  100 I ActivityManager: Start proc app.calmhome")
+        if sc.get("crash"):
+            print("10-20 12:00:01.000  200  200 E AndroidRuntime: FATAL EXCEPTION: main\n"
+                  "10-20 12:00:01.000  200  200 E AndroidRuntime: Process: app.calmhome, PID: 200")
+    sys.exit(0)
+if a[0] == "pull":
+    content = st.setdefault("devfiles", {}).get(a[1])
+    if content is None:
+        print("adb: error: failed to stat remote object '%s': No such file or directory" % a[1], file=sys.stderr)
+        sys.exit(1)
+    open(a[2], "w", newline="").write(content)
+    print("%s: 1 file pulled, 0 skipped." % a[1])
+    sys.exit(0)
+if a[0] == "exec-out" and a[1:3] == ["screencap", "-p"]:
+    import struct
+    import zlib
+    wall = any(k.endswith("wallpaper.img") for k in st.get("files", {}))
+    rgb = tuple(sc.get("wallpaper_pixel", [84, 26, 29])) if wall else (13, 17, 23)
+    if wall and sc.get("wallpaper_not_drawn"):
+        rgb = (13, 17, 23)
+    w, h = 1920, 1080
+    raw = (b"\x00" + bytes(rgb) * w) * h
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
+    sys.stdout.buffer.write(png)
+    sys.exit(0)
 if a[0] == "reboot":
     sys.exit(0)
 if a[0] == "wait-for-device":
     sys.exit(0)
 
-c = a[1]
+c = " ".join(a[1:])      # like real adb: `adb shell settings get x y` is one command line
 
 
 def pk(items):
@@ -115,11 +156,52 @@ elif c == "dumpsys meminfo":
           "     90,500K: com.vendor.promo.service:remote (pid 2)\n     60,000K: com.google.android.gms (pid 3)\n"
           "     12,000K: com.mytuner (pid 4)\n      3,000K: com.vendor.smalljunk (pid 5)\n\n"
           "Total RAM: 1,900,000K (status normal)\n Free RAM: 400,000K (  1 cached)")
+elif c == "pm list packages":
+    pk(set(st["system"]) | set(st["user"]) | ({"app.calmhome"} if st["installed"] else set()))
+elif c.startswith("dumpsys package app.calmhome"):
+    out("Packages:", "  Package [app.calmhome]", "    requested permissions:",
+        *(["      android.permission.INTERNET"] if sc.get("requests_permission") else []),
+        "    install permissions:")
+elif c.startswith("pidof"):
+    if st["installed"] and not sc.get("dies"):
+        print("4242")
+    else:
+        sys.exit(1)
+elif c.startswith("uiautomator dump"):
+    tiles = ["Settings"] if sc.get("no_app_tiles") else ["Movies", "Series", "Music", "Settings"]
+    focus = min(st.get("focus", 0), len(tiles) - 1)
+    nodes = ['<node class="android.widget.TextView" text="7:42 PM" focused="false" />']
+    for i, t in enumerate(tiles):
+        nodes.append('<node class="android.widget.LinearLayout" clickable="true" focused="%s" text="">'
+                     '<node class="android.widget.TextView" text="%s" focused="false" /></node>'
+                     % ("true" if i == focus else "false", t))
+    if st.get("dialog") and not sc.get("dialog_never_opens"):
+        nodes.append('<node class="android.widget.TextView" text="Move to front" focused="false" />')
+    xml = "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy>" + "".join(nodes) + "</hierarchy>"
+    st.setdefault("devfiles", {})["/sdcard/ui.xml"] = xml; save()
+    print("UI hierarchy dumped to: /sdcard/ui.xml")
+elif c.startswith("input keyevent"):
+    key = c.split()[-1]
+    tiles = ["Settings"] if sc.get("no_app_tiles") else ["Movies", "Series", "Music", "Settings"]
+    f = st.get("focus", 0)
+    if key == "KEYCODE_DPAD_RIGHT":
+        f = min(f + 1, len(tiles) - 1)
+    elif key == "KEYCODE_DPAD_LEFT":
+        f = max(f - 1, 0)
+    elif key == "KEYCODE_MENU":
+        st["dialog"] = tiles[min(f, len(tiles) - 1)] not in ("Settings",)
+    elif key == "KEYCODE_BACK":
+        st["dialog"] = False
+    elif key == "KEYCODE_HOME":
+        f, st["dialog"] = 0, False
+    st["focus"] = f; save()
 elif c.startswith("pm list packages app.calmhome"):
     if st["installed"]:
         print("package:app.calmhome")
 elif c.startswith("am start"):
     st["started"] = st.get("started", 0) + 1; save()
+    if "-W" in c:
+        print("Starting: Intent { cmp=app.calmhome/.MainActivity }\nStatus: ok\nActivity: app.calmhome/.MainActivity\nComplete")
 elif c.startswith("mkdir"):
     st.setdefault("dirs", []).append(c.split()[-1]); save()
 elif c.startswith("mv "):
@@ -194,8 +276,9 @@ elif c.startswith("cmd package set-home-activity"):
         st["home_ours"] = True
     save()
 elif c.startswith("input"):
-    pass
+    pass          # (other input commands)
 elif c.startswith("settings"):
     pass
 else:
-    print("unhandled: " + c, file=sys.stderr)
+    print("fake_adb: unhandled shell command: " + c, file=sys.stderr)
+    sys.exit(127)

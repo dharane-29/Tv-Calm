@@ -6,7 +6,6 @@ import io
 import json
 import os
 import shutil
-import stat
 import struct
 import sys
 import tempfile
@@ -21,21 +20,16 @@ import tvcalm  # noqa: E402
 
 IP = "192.168.1.50"
 
-if os.name == "nt":   # the simulated adb is a POSIX shell shim; CI and macOS/Linux run these
-    raise unittest.SkipTest("simulated-TV tests need a POSIX shell")
 
 
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.bin = self.tmp / "bin"
-        self.bin.mkdir()
-        shim = self.bin / "adb"
-        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{HERE / "fake_adb.py"}" "$@"\n')
-        shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
         self.state = self.tmp / "state.json"
         self.env_backup = dict(os.environ)
-        os.environ["PATH"] = str(self.bin) + os.pathsep + os.environ["PATH"]
+        # The simulated TV is a Python script run through TVCALM_ADB: no shell shim, so this
+        # works the same on Windows, macOS and Linux.
+        os.environ["TVCALM_ADB"] = json.dumps([sys.executable, str(HERE / "fake_adb.py")])
         os.environ["FAKE_ADB_STATE"] = str(self.state)
         self.state_dir_backup = tvcalm.STATE
         tvcalm.STATE = self.tmp / "tvcalm-state"
@@ -124,6 +118,7 @@ class TestConnection(Base):
 
     def test_adb_missing(self):
         self.init()
+        os.environ.pop("TVCALM_ADB", None)
         os.environ["PATH"] = str(self.tmp / "empty")
         os.environ.pop("ANDROID_HOME", None)
         os.environ.pop("ANDROID_SDK_ROOT", None)
@@ -657,6 +652,305 @@ class TestPngReader(unittest.TestCase):
             pngpx.decode(b"nope")
 
 
+def bash_works():
+    exe = shutil.which("bash")
+    if not exe:
+        return None
+    try:
+        r = __import__("subprocess").run([exe, "-c", "echo ok"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    return exe if r.returncode == 0 and r.stdout.strip() == "ok" else None
+
+
+@unittest.skipUnless(bash_works(), "needs bash (Git Bash on Windows)")
+class TestSmokeHelpers(unittest.TestCase):
+    """The shell helpers behind tests/emulator_smoke.sh, including the Windows carriage-return bug."""
+
+    def run_lib(self, snippet, arg):
+        import subprocess
+        script = 'source tests/smoke_lib.sh; ' + snippet
+        r = subprocess.run([bash_works(), "-c", script, "_", arg], cwd=str(ROOT),
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout.replace("\r", "<CR>").strip(), r.stderr.strip()
+
+    VISIBLE = 'parse_pixel "$1" || { echo PARSE_FAIL; exit 3; }; if wallpaper_visible; then echo VISIBLE; else echo HIDDEN; fi'
+
+    def test_real_world_pixel_values(self):
+        # 84 26 29 is the value the Windows run actually measured.
+        for text, want in (("84 26 29", "VISIBLE"), ("84 26 29\r", "VISIBLE"), ("84 26 29\r\n", "VISIBLE"),
+                           ("200 40 40\r", "VISIBLE"), ("50 0 25\r", "VISIBLE")):
+            code, out, err = self.run_lib(self.VISIBLE, text)
+            self.assertEqual((out, err), (want, ""), repr(text))
+
+    def test_wrong_pixels_are_rejected_not_skipped(self):
+        """With the old code, a CR made bash abandon the check. These must give a clear HIDDEN verdict."""
+        for text in ("60 55 55\r", "70 60 60\r", "90 80 70\r", "49 0 0\r", "13 17 23\r", "50 0 26\r"):
+            code, out, err = self.run_lib(self.VISIBLE, text)
+            self.assertEqual((out, err), ("HIDDEN", ""), repr(text))
+
+    def test_garbage_is_a_loud_failure(self):
+        for text in ("", "abc", "1 2", "84 26 29 7", "84,26,29", "Python was not found"):
+            code, out, err = self.run_lib(self.VISIBLE, text)
+            self.assertEqual(out, "PARSE_FAIL", repr(text))
+            self.assertEqual(code, 3, repr(text))
+
+    def test_plain_background_check(self):
+        snippet = 'parse_pixel "$1" || exit 3; if background_plain; then echo PLAIN; else echo NOT_PLAIN; fi'
+        for text, want in (("13 17 23\r", "PLAIN"), ("13 17 23", "PLAIN"), ("84 26 29\r", "NOT_PLAIN"),
+                           ("26 17 23", "NOT_PLAIN"), ("0 0 0", "PLAIN")):
+            self.assertEqual(self.run_lib(snippet, text)[1], want, repr(text))
+
+    def test_leading_zeros_are_not_octal(self):
+        code, out, err = self.run_lib('parse_pixel "$1" && echo "$R $G $B"', "08 09 010")
+        self.assertEqual((out, err), ("8 9 10", ""))
+
+    def test_smoke_script_uses_the_safe_parser(self):
+        text = (ROOT / "tests" / "emulator_smoke.sh").read_text()
+        self.assertIn("parse_pixel", text)
+        self.assertNotIn("read -r R G B", text)          # the pattern that caused the bug
+        self.assertNotIn("$((R - B))", text)              # arithmetic belongs inside the tested helpers
+
+    def test_summary_runs_with_nothing_recorded(self):
+        code, out, err = self.run_lib('set -u; print_summary', "")
+        self.assertEqual(code, 0, err)
+
+    def test_pass_and_note_are_listed(self):
+        code, out, _ = self.run_lib('pass "alpha"; note "beta not exercised"; print_summary', "")
+        self.assertIn("PASS  alpha", out)
+        self.assertIn("NOTE  beta not exercised", out)
+
+
+class TestUiFocus(unittest.TestCase):
+    XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+ <node class="android.widget.FrameLayout" focused="false" text="">
+  <node class="android.widget.LinearLayout" focused="false" clickable="true" text="">
+   <node class="android.widget.TextView" text="Music" focused="false"/>
+  </node>
+  <node class="android.widget.LinearLayout" focused="true" clickable="true" text="">
+   <node class="android.widget.FrameLayout" text=""/>
+   <node class="android.widget.TextView" text="Movies" focused="false"/>
+  </node>
+  <node class="android.widget.TextView" text="7:42 PM" focused="false"/>
+ </node>
+</hierarchy>"""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE))
+        import ui_focus
+        self.m = ui_focus
+        self.path = Path(tempfile.mkdtemp()) / "ui.xml"
+        self.path.write_text(self.XML)
+
+    def test_focused_label(self):
+        self.assertEqual(self.m.focused_label(self.m.load(str(self.path))), "Movies")
+
+    def test_no_focus(self):
+        self.path.write_text(self.XML.replace('focused="true"', 'focused="false"'))
+        self.assertIsNone(self.m.focused_label(self.m.load(str(self.path))))
+
+    def test_has_text(self):
+        root = self.m.load(str(self.path))
+        self.assertTrue(self.m.has_text(root, "7:42 PM"))
+        self.assertFalse(self.m.has_text(root, "Move to front"))
+
+    def test_is_app(self):
+        for label in ("Movies", "YouTube", "Live TV", "HDMI"[:0] + "Game console"):
+            self.assertTrue(self.m.is_app(label), label)
+        for label in ("Settings", "settings", "Hidden (3)", "HDMI 1", "HDMI", "", None):
+            self.assertFalse(self.m.is_app(label), label)
+
+    def test_command_line(self):
+        import subprocess
+        run = lambda *a: subprocess.run([sys.executable, str(HERE / "ui_focus.py"), *a], capture_output=True)  # noqa: E731
+        r = run("focus", str(self.path))
+        self.assertEqual((r.returncode, r.stdout), (0, b"Movies\n"))        # LF only, never CRLF
+        self.assertEqual(run("has", str(self.path), "Movies").returncode, 0)
+        self.assertEqual(run("has", str(self.path), "Nope").returncode, 1)
+        self.assertEqual(run("is-app", "Settings").returncode, 1)
+        self.assertEqual(run("bogus").returncode, 2)
+
+
+class TestPickCandidate(unittest.TestCase):
+    SAMPLE = """DRY RUN. Candidates, largest memory users first:
+    210 MB  com.vendor.bigjunk
+     90 MB  com.vendor.promo.service   <- looks like ads/promo/telemetry
+     40 MB  com.google.android.katniss   <- CAUTION
+      3 MB  com.vendor.smalljunk
+      0 MB  com.google.android.tv   <- CAUTION
+
+Re-run with --apply to choose one by one. There is no 'yes to all'.
+"""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE))
+        import pick_candidate
+        self.m = pick_candidate
+
+    def test_picks_smallest_non_caution(self):
+        self.assertEqual(self.m.pick(self.SAMPLE), "com.vendor.smalljunk")
+
+    def test_handles_crlf_and_na(self):
+        self.assertEqual(self.m.pick(self.SAMPLE.replace("\n", "\r\n")), "com.vendor.smalljunk")
+        self.assertEqual(self.m.pick("   n/a  com.foo.bar\n"), "com.foo.bar")
+
+    def test_nothing_suitable(self):
+        self.assertIsNone(self.m.pick(""))
+        self.assertIsNone(self.m.pick("    5 MB  com.x   <- CAUTION\n"))
+        self.assertIsNone(self.m.pick("Nothing selected.\n"))
+
+
+class TestPixelCliOutput(unittest.TestCase):
+    def test_no_carriage_return_on_any_platform(self):
+        import subprocess
+        path = Path(tempfile.mkdtemp()) / "red.png"
+        rows = [bytes([200, 40, 40] * 8) for _ in range(8)]
+        path.write_bytes(TestPngReader.encode(rows, 8, 3))
+        r = subprocess.run([sys.executable, str(HERE / "pngpx.py"), str(path), "4", "4", "2"], capture_output=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, b"200 40 40\n")            # exactly LF: Windows text-mode print would add CR
+
+
+@unittest.skipUnless(bash_works(), "needs bash (Git Bash on Windows)")
+class TestSmokeScript(unittest.TestCase):
+    """Runs the REAL tests/emulator_smoke.sh against a simulated device.
+
+    This checks the script's own logic (parsing, control flow, honesty of its verdicts). It does
+    not prove anything about Android; the real emulator run does that.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        shim = bindir / "adb"
+        shim.write_text('#!/usr/bin/env bash\nexec "%s" "%s" "$@"\n'
+                        % (Path(sys.executable).as_posix(), (HERE / "fake_adb.py").as_posix()))
+        shim.chmod(0o755)
+        self.state = self.tmp / "state.json"
+        self.env = dict(os.environ)
+        self.env.update({
+            "PATH": bindir.as_posix() + os.pathsep + os.environ["PATH"],
+            "TVCALM_ADB": json.dumps([sys.executable, str(HERE / "fake_adb.py")]),
+            "FAKE_ADB_STATE": str(self.state), "FAKE_ADB_SERIAL": "emulator-5554",
+            "HOME": str(self.tmp), "USERPROFILE": str(self.tmp), "SMOKE_FAST": "1",
+        })
+        for k in ("SMOKE_STRICT", "SMOKE_DEBLOAT", "TV"):
+            self.env.pop(k, None)
+        self.out_dir = ROOT / "out"
+        self.apk = self.out_dir / "calmhome.apk"
+        self.made_apk = not self.apk.exists()
+        if self.made_apk:
+            self.out_dir.mkdir(exist_ok=True)
+            self.apk.write_bytes(b"dummy-apk")
+            side = self.out_dir / "calmhome.apk.sha256"
+            if side.exists():
+                side.unlink()
+
+    def tearDown(self):
+        if self.made_apk:
+            self.apk.unlink()
+            try:
+                self.out_dir.rmdir()
+            except OSError:
+                pass
+        shutil.rmtree(ROOT / "smoke-out", ignore_errors=True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def scenario(self, remove_system=(), **sc):
+        import subprocess
+        subprocess.run([sys.executable, str(HERE / "fake_adb.py"), "devices"], env=self.env, capture_output=True)
+        st = json.loads(self.state.read_text())
+        st["scenario"].update(sc)
+        st["system"] = [p for p in st["system"] if p not in remove_system]
+        self.state.write_text(json.dumps(st))
+
+    def smoke(self, **extra_env):
+        import subprocess
+        env = dict(self.env)
+        env.update(extra_env)
+        r = subprocess.run([bash_works(), "tests/emulator_smoke.sh"], cwd=str(ROOT), env=env,
+                           capture_output=True, text=True, timeout=300)
+        return r.returncode, (r.stdout + r.stderr).replace("\r", "")
+
+    def test_happy_path_passes_every_check(self):
+        self.scenario()
+        code, out = self.smoke()
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertIn("SMOKE OK", out)
+        for line in ("PASS  scan, debloat dry run", "PASS  install, and the app requests zero permissions",
+                     "PASS  launches; Settings tile and clock", "PASS  options dialog opens",
+                     "PASS  Back does nothing", "PASS  wallpaper shows on screen, then is removed",
+                     "PASS  no crash for app.calmhome", "PASS  undo removes the launcher"):
+            self.assertIn(line, out)
+        self.assertNotIn("NOTE", out)
+        self.assertIn("screen pixel with wallpaper: 84 26 29", out)          # the value seen on the real emulator
+        self.assertIn("screen pixel after removal: 13 17 23", out)
+
+    def test_wrong_wallpaper_pixel_fails_the_run(self):
+        """R passes the first test (>= 50) but red-minus-blue is only 5. The old script skipped this."""
+        self.scenario(wallpaper_pixel=[60, 55, 55])
+        code, out = self.smoke()
+        self.assertNotEqual(code, 0)
+        self.assertIn("wallpaper not visible on screen (pixel 60 55 55)", out)
+        self.assertNotIn("SMOKE OK", out)
+
+    def test_wallpaper_never_drawn_fails_the_run(self):
+        self.scenario(wallpaper_not_drawn=True)
+        code, out = self.smoke()
+        self.assertNotEqual(code, 0)
+        self.assertIn("wallpaper not visible on screen", out)
+        self.assertNotIn("SMOKE OK", out)
+
+    def test_no_app_tile_is_a_note_not_a_pass(self):
+        self.scenario(no_app_tiles=True)
+        code, out = self.smoke()
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertIn("NOTE  options dialog NOT EXERCISED", out)
+        self.assertNotIn("PASS  options dialog opens", out)
+        self.assertIn("SMOKE OK", out)
+
+    def test_strict_mode_turns_the_note_into_a_failure(self):
+        self.scenario(no_app_tiles=True)
+        code, out = self.smoke(SMOKE_STRICT="1")
+        self.assertNotEqual(code, 0)
+        self.assertIn("SMOKE_STRICT=1", out)
+        self.assertNotIn("SMOKE OK", out)
+
+    def test_dialog_that_never_opens_is_not_reported_as_passed(self):
+        self.scenario(dialog_never_opens=True)
+        code, out = self.smoke()
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertIn("NOTE  options dialog NOT EXERCISED", out)
+        self.assertNotIn("PASS  options dialog opens", out)
+
+    def test_permission_request_fails(self):
+        self.scenario(requests_permission=True)
+        code, out = self.smoke()
+        self.assertNotEqual(code, 0)
+        self.assertIn("launcher requests 1 permissions", out)
+
+    def test_crash_in_logcat_fails(self):
+        self.scenario(crash=True)
+        code, out = self.smoke()
+        self.assertNotEqual(code, 0)
+        self.assertIn("crash in logcat", out)
+
+    def test_dead_process_fails(self):
+        self.scenario(dies=True)
+        code, out = self.smoke()
+        self.assertNotEqual(code, 0)
+        self.assertIn("process not running", out)
+
+    def test_optional_debloat_apply_and_restore(self):
+        self.scenario(remove_system=("com.break.everything",))     # that package is a test booby-trap
+        code, out = self.smoke(SMOKE_DEBLOAT="1")
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertIn("PASS  debloat apply + restore (com.vendor.smalljunk)", out)
+        self.assertEqual(json.loads(self.state.read_text())["disabled"], [])      # fully restored
+
+
 class TestCli(unittest.TestCase):
     def test_help_and_errors(self):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -671,7 +965,7 @@ class TestCli(unittest.TestCase):
             self.assertNotEqual(c.exception.code, 0)
 
 
-@unittest.skipUnless(os.environ.get("ANDROID_HOME") and shutil.which("javac"), "needs Android SDK + JDK")
+@unittest.skipUnless(tvcalm.locate_sdk() and shutil.which("javac"), "needs an Android SDK and a JDK")
 class TestRealBuild(unittest.TestCase):
     def test_build_produces_valid_apk(self):
         import subprocess
