@@ -16,7 +16,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - run: python3 tests/run_all.py
+      - run: python3 tests/run_all.py --strict
       - run: python3 tvcalm.py build
       - name: Enable KVM
         run: |
