@@ -1,0 +1,22 @@
+# Runs the unit and simulated-TV tests on a real Windows machine (GitHub's), because the
+# Python tests are meant to work natively on Windows but that has not been confirmed yet.
+# Run manually: Actions > windows-tests > Run workflow. Read the SUMMARY at the end of the log.
+name: windows-tests
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: All tests (skips are listed in the summary; not made fatal here)
+        run: python tests/run_all.py
