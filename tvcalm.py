@@ -127,24 +127,17 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def find_adb() -> list:
-    """The adb command as a list. TVCALM_ADB (a path, or a JSON list like
-    ["python", "fake_adb.py"]) overrides discovery; the tests use it to run a simulated TV."""
-    override = os.environ.get("TVCALM_ADB")
-    if override:
-        if override.lstrip().startswith("["):
-            return [str(x) for x in json.loads(override)]
-        return [override]
+def find_adb() -> str:
     found = shutil.which("adb")
     if found:
-        return [found]
+        return found
     for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
         base = os.environ.get(env)
         if base:
             for name in ("adb", "adb.exe"):
                 c = Path(base) / "platform-tools" / name
                 if c.exists():
-                    return [str(c)]
+                    return str(c)
     die("adb not found. Install Android platform-tools "
         "(https://developer.android.com/tools/releases/platform-tools) and retry.")
 
@@ -152,14 +145,14 @@ def find_adb() -> list:
 class TV:
     def __init__(self, target: str):
         self.adb = find_adb()
-        known = {l.split()[0] for l in run([*self.adb, "devices"], 20)[1].splitlines()[1:] if l.strip()}
+        known = {l.split()[0] for l in run([self.adb, "devices"], 20)[1].splitlines()[1:] if l.strip()}
         if target in known or ":" in target or target.startswith("emulator-"):
             self.serial = target
         else:
             self.serial = target + ":5555"       # bare IP or hostname: default adb port
         if self.serial not in known and not self.serial.startswith("emulator-"):
-            run([*self.adb, "connect", self.serial], 20)
-        rc, out, err = run([*self.adb, "-s", self.serial, "get-state"], 20)
+            run([self.adb, "connect", self.serial], 20)
+        rc, out, err = run([self.adb, "-s", self.serial, "get-state"], 20)
         if "unauthorized" in out + err:
             die('The TV is asking "Allow debugging?". Choose "Always allow" on the TV, then re-run.')
         if out != "device":
@@ -167,10 +160,10 @@ class TV:
                 "USB/network debugging is enabled in Developer options.")
 
     def raw(self, *args, timeout=180):
-        return run([*self.adb, "-s", self.serial, *args], timeout)
+        return run([self.adb, "-s", self.serial, *args], timeout)
 
     def sh_rc(self, cmd: str, timeout=120):
-        rc, out, err = run([*self.adb, "-s", self.serial, "shell", cmd], timeout)
+        rc, out, err = run([self.adb, "-s", self.serial, "shell", cmd], timeout)
         return rc, (out + ("\n" + err if err else "")).strip()
 
     def sh(self, cmd: str, timeout=120) -> str:
@@ -430,8 +423,8 @@ def reboot_and_report(tv: TV, before_free):
     print("Rebooting...")
     tv.raw("reboot")
     time.sleep(10)
-    run([*tv.adb, "connect", tv.serial], 20)
-    run([*tv.adb, "-s", tv.serial, "wait-for-device"], 180)
+    run([tv.adb, "connect", tv.serial], 20)
+    run([tv.adb, "-s", tv.serial, "wait-for-device"], 180)
     for _ in range(60):
         if tv.prop("sys.boot_completed") == "1":
             break
@@ -672,9 +665,9 @@ def cmd_lockdown(a):
         return
     tv.sh("settings put global adb_wifi_enabled 0")
     tv.sh("settings put global adb_enabled 0")
-    run([*tv.adb, "disconnect", tv.serial], 10)
+    run([tv.adb, "disconnect", tv.serial], 10)
     time.sleep(3)
-    rc, out, err = run([*tv.adb, "connect", tv.serial], 15)
+    rc, out, err = run([tv.adb, "connect", tv.serial], 15)
     reachable = bool(re.match(r"(already )?connected to", out))
     print("Still reachable!" if reachable else "ADB is off.")
     print("For good measure: TV Settings > Developer options > Revoke USB debugging authorizations.")
@@ -682,8 +675,7 @@ def cmd_lockdown(a):
 
 # ------------------------------------------------------------------------ build
 
-def locate_sdk():
-    """The Android SDK folder, or None."""
+def find_sdk() -> Path:
     for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
         v = os.environ.get(env)
         if v and Path(v).is_dir():
@@ -692,14 +684,7 @@ def locate_sdk():
               Path(os.environ.get("LOCALAPPDATA", "~nope")) / "Android/Sdk"):
         if c.is_dir():
             return c
-    return None
-
-
-def find_sdk() -> Path:
-    sdk = locate_sdk()
-    if sdk is None:
-        die("Android SDK not found. Set ANDROID_HOME (needs build-tools and one platform).")
-    return sdk
+    die("Android SDK not found. Set ANDROID_HOME (needs build-tools and one platform).")
 
 
 def _ver(p: Path):

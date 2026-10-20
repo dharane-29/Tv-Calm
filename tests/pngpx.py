@@ -66,5 +66,4 @@ def average(path: str, x: int, y: int, radius: int = 6):
 
 if __name__ == "__main__":
     px = average(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 6)
-    # Write bytes: text-mode print() would emit "\r\n" on Windows and break shell parsing.
-    sys.stdout.buffer.write(("%d %d %d\n" % px).encode("ascii"))
+    print("%d %d %d" % px)
