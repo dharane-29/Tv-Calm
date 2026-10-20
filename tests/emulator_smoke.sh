@@ -50,6 +50,34 @@ key KEYCODE_HOME
 sleep 2
 adb shell pidof "$PKG" >/dev/null || fail "process died after Home"
 
+echo "== wallpaper =="
+python3 - <<'PY'
+import struct, zlib
+w, h = 1280, 720
+raw = b"".join(b"\x00" + bytes([200, 40, 40]) * w for _ in range(h))
+def chunk(tag, data):
+    body = tag + data
+    return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+open("smoke-out/wall.png", "wb").write(png)
+PY
+python3 tvcalm.py wallpaper "$TV" smoke-out/wall.png --dim 50
+sleep 6
+shot with-wallpaper
+read -r R G B < <(python3 tests/pngpx.py "$OUT/with-wallpaper.png" 30 540 8)
+echo "screen pixel with wallpaper: $R $G $B"
+{ [ "$R" -ge 50 ] && [ $((R - B)) -ge 25 ]; } || fail "wallpaper not visible on screen (pixel $R $G $B)"
+adb shell pidof "$PKG" >/dev/null || fail "launcher died after wallpaper"
+ui
+grep -q 'text="Settings"' "$OUT/ui.xml" || fail "tiles missing with wallpaper"
+python3 tvcalm.py wallpaper "$TV" --remove
+sleep 4
+shot no-wallpaper
+read -r R G B < <(python3 tests/pngpx.py "$OUT/no-wallpaper.png" 30 540 8)
+echo "screen pixel after removal: $R $G $B"
+[ "$R" -le 25 ] || fail "wallpaper still showing after removal (pixel $R $G $B)"
+
 echo "== crash check =="
 adb logcat -d > "$OUT/logcat.txt"
 if grep -E "FATAL EXCEPTION|AndroidRuntime.*$PKG" "$OUT/logcat.txt" | grep -q "$PKG"; then

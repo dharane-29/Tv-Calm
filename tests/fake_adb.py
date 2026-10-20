@@ -87,6 +87,13 @@ if a[0] == "install":
 if a[0] == "uninstall":
     st["installed"] = False; st["home_ours"] = False; sc["_replaced"] = True; save()
     print("Success"); sys.exit(0)
+if a[0] == "push":
+    files = st.setdefault("files", {})
+    if sc.get("push_direct_fails") and a[2].startswith("/sdcard/"):
+        print("adb: error: failed to copy: Permission denied", file=sys.stderr); sys.exit(1)
+    if sc.get("push_all_fail"):
+        print("adb: error: failed to copy", file=sys.stderr); sys.exit(1)
+    files[a[2]] = "pushed:" + os.path.basename(a[1]); save(); print("1 file pushed"); sys.exit(0)
 if a[0] == "reboot":
     sys.exit(0)
 if a[0] == "wait-for-device":
@@ -108,6 +115,30 @@ elif c == "dumpsys meminfo":
           "     90,500K: com.vendor.promo.service:remote (pid 2)\n     60,000K: com.google.android.gms (pid 3)\n"
           "     12,000K: com.mytuner (pid 4)\n      3,000K: com.vendor.smalljunk (pid 5)\n\n"
           "Total RAM: 1,900,000K (status normal)\n Free RAM: 400,000K (  1 cached)")
+elif c.startswith("pm list packages app.calmhome"):
+    if st["installed"]:
+        print("package:app.calmhome")
+elif c.startswith("am start"):
+    st["started"] = st.get("started", 0) + 1; save()
+elif c.startswith("mkdir"):
+    st.setdefault("dirs", []).append(c.split()[-1]); save()
+elif c.startswith("mv "):
+    _, src, dst = c.split(); fl = st.setdefault("files", {})
+    if src in fl:
+        fl[dst] = fl.pop(src); save()
+elif c.startswith("rm -f"):
+    fl = st.setdefault("files", {})
+    for p_ in c.split()[2:]:
+        fl.pop(p_, None)
+    save()
+elif c.startswith("ls "):
+    p_ = c.split()[-1]
+    print(p_ if p_ in st.setdefault("files", {}) else "ls: %s: No such file or directory" % p_)
+elif c.startswith("cat ") and ">" in c:
+    src, dst = c.split()[1], c.split()[-1]; fl = st.setdefault("files", {})
+    fl[dst] = fl.get(src, "?"); save()
+elif c.startswith("echo ") and ">" in c:
+    parts = c.split(); st.setdefault("files", {})[parts[-1]] = "cfg:" + parts[1]; save()
 elif c.startswith("pm list packages"):
     f = c.split()[-1]
     pk({"-s": set(st["system"]), "-3": set(st["user"]), "-d": set(st["disabled"])}[f])

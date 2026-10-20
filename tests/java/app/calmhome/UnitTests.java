@@ -144,11 +144,188 @@ public class UnitTests {
         }
     }
 
+
+    // ----------------------------------------------------------------- Scrim
+    static int grey(int g) { return (g << 16) | (g << 8) | g; }
+
+    static void scrimMaths() {
+        check(Scrim.luminance(0x000000) == 0.0, "black luminance");
+        check(Math.abs(Scrim.luminance(0xFFFFFF) - 1.0) < 1e-9, "white luminance");
+        check(Math.abs(Scrim.contrast(1.0, 0.0) - 21.0) < 1e-9, "max contrast is 21");
+        for (double y = 0; y <= 1.0001; y += 0.01) {
+            double back = Scrim.luminance(grey(Scrim.greyFromLuminance(y)));
+            check(Math.abs(back - y) < 0.01, "grey round trip at " + y);
+        }
+        double prev = -1;
+        for (double y = 0; y <= 1.0001; y += 0.01) {
+            double a = Scrim.requiredAlpha(y);
+            check(a >= prev - 1e-9, "required alpha is non-decreasing at " + y);
+            check(a >= 0 && a < Scrim.MAX_ALPHA, "required alpha stays below the cap at " + y);
+            prev = a;
+            int g = Scrim.greyFromLuminance(y);
+            int shown = Scrim.blend(Scrim.BASE, a, grey(g));
+            double c = Scrim.contrast(Scrim.luminance(Scrim.DIM_TEXT), Scrim.luminance(shown));
+            check(c >= Scrim.TARGET_CONTRAST - 0.02, "contrast met at luminance " + y + " (got " + c + ")");
+        }
+        check(Scrim.requiredAlpha(0.0) == 0.0, "a dark wallpaper needs no extra darkening");
+        // The worst possible wallpaper (pure white) still gives readable text after darkening.
+        int worst = Scrim.blend(Scrim.BASE, Scrim.requiredAlpha(1.0), 0xFFFFFF);
+        check(Scrim.contrast(Scrim.luminance(Scrim.DIM_TEXT), Scrim.luminance(worst)) >= 4.5, "white wallpaper readable");
+        check(Scrim.contrast(Scrim.luminance(Scrim.TEXT), Scrim.luminance(worst)) >= 7.0, "main text on white wallpaper");
+    }
+
+    static void scrimAnalysis() {
+        int w = 40, h = 40;
+        int[] white = new int[w * h], black = new int[w * h], split = new int[w * h], clear = new int[w * h];
+        for (int i = 0; i < w * h; i++) {
+            white[i] = 0xFFFFFFFF; black[i] = 0xFF000000; clear[i] = 0x00FFFFFF;
+            split[i] = (i / w < h / 2) ? 0xFFFFFFFF : 0xFF000000;
+        }
+        for (double v : Scrim.bandLuminance(white, w, h, 8, 0.95)) check(v > 0.99, "white image is bright");
+        for (double v : Scrim.bandLuminance(black, w, h, 8, 0.95)) check(v < 0.001, "black image is dark");
+        for (double v : Scrim.bandLuminance(clear, w, h, 8, 0.95)) check(v < 0.001, "transparent pixels show the dark base");
+        double[] sp = Scrim.bandLuminance(split, w, h, 8, 0.95);
+        for (int k = 0; k < 8; k++) check(k < 4 ? sp[k] > 0.99 : sp[k] < 0.001, "split image band " + k);
+        // A few bright specks must not darken the whole band; a large bright area must.
+        int[] specks = new int[w * h], patch = new int[w * h];
+        java.util.Arrays.fill(specks, 0xFF000000); java.util.Arrays.fill(patch, 0xFF000000);
+        for (int i = 0; i < 30; i++) specks[i * 7] = 0xFFFFFFFF;            // 30 of 1600 pixels (< 5%)
+        for (int i = 0; i < 400; i++) patch[i] = 0xFFFFFFFF;                // a quarter of the picture
+        check(Scrim.bandLuminance(specks, w, h, 1, 0.95)[0] < 0.01, "specks ignored");
+                check(Scrim.bandLuminance(patch, w, h, 4, 0.95)[0] > 0.99, "bright band detected");
+        // Bad input never throws and assumes the worst.
+        for (double v : Scrim.bandLuminance(null, 10, 10, 8, 0.95)) check(v == 1.0, "null pixels");
+        for (double v : Scrim.bandLuminance(new int[5], 10, 10, 8, 0.95)) check(v == 1.0, "short pixels");
+        for (double v : Scrim.bandLuminance(white, 0, 0, 8, 0.95)) check(v == 1.0, "zero size");
+        check(Scrim.bandLuminance(new int[3], 3, 1, 8, 0.95).length == 8, "tiny picture, many bands");
+    }
+
+    static void scrimStops() {
+        double[] dark = new double[Scrim.BANDS], bright = new double[Scrim.BANDS];
+        java.util.Arrays.fill(bright, 1.0);
+        float[] d0 = Scrim.stops(dark, 0), d100 = Scrim.stops(dark, 100), b0 = Scrim.stops(bright, 0);
+        check(d0.length == Scrim.BANDS + 1, "stop count");
+        for (int j = 0; j < d0.length; j++) {
+            check(d0[j] >= 0f && d0[j] <= Scrim.MAX_ALPHA, "alpha in range");
+            check(d100[j] >= d0[j], "more dim is never lighter");
+            check(b0[j] >= Scrim.requiredAlpha(1.0) - 1e-6, "bright wallpaper is darkened enough");
+            if (j > 0) check(d0[j] >= d0[j - 1] - 1e-6, "soft gradient gets darker downwards");
+        }
+        check(d0[0] >= 0.16f, "even a dark wallpaper gets a visible soft gradient");
+        float[] b100 = Scrim.stops(bright, 100), b40 = Scrim.stops(bright, 40);
+        for (int j = 0; j < b0.length; j++) {
+            check(b40[j] > b0[j] + 0.01f && b100[j] > b40[j] + 0.01f, "dim setting always has an effect, even on bright pictures");
+            check(b100[j] <= Scrim.MAX_ALPHA, "never above the cap");
+        }
+        check(d100[0] - d0[0] > 0.3f, "dim setting has a large effect on dark pictures");
+        check(Scrim.stops(null, 40).length == Scrim.BANDS + 1, "null band data handled");
+        check(Scrim.alphaAt(d0, 0.0) == d0[0] && Scrim.alphaAt(d0, 1.0) == d0[Scrim.BANDS], "alphaAt ends");
+        check(Scrim.alphaAt(d0, -5) == d0[0] && Scrim.alphaAt(d0, 5) == d0[Scrim.BANDS], "alphaAt clamps");
+
+        // Property: at EVERY point inside a band, the alpha is at least what that band needs.
+        Random r = new Random(7);
+        for (int round = 0; round < 2000; round++) {
+            double[] lum = new double[Scrim.BANDS];
+            for (int k = 0; k < lum.length; k++) lum[k] = r.nextDouble();
+            float[] st = Scrim.stops(lum, r.nextInt(101));
+            for (int k = 0; k < lum.length; k++) {
+                for (int step = 0; step <= 10; step++) {
+                    double y01 = (k + step / 10.0) / lum.length;
+                    check(Scrim.alphaAt(st, y01) >= Scrim.requiredAlpha(lum[k]) - 1e-6,
+                            "interpolated alpha covers band " + k);
+                }
+            }
+        }
+    }
+
+    /** Whole pipeline on synthetic wallpapers: measure -> darken -> check text contrast per pixel. */
+    static void scrimEndToEnd() {
+        final int w = 96, h = 54;
+        Random r = new Random(11);
+        String[] names = { "white", "black", "mid grey", "noise", "h-gradient", "v-gradient",
+                "bright top / dark bottom", "dark top / bright bottom", "checker", "saturated colours", "sunset" };
+        for (int n = 0; n < names.length; n++) {
+            int[] px = new int[w * h];
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int v;
+                    switch (n) {
+                        case 0: v = grey(255); break;
+                        case 1: v = grey(0); break;
+                        case 2: v = grey(128); break;
+                        case 3: v = (r.nextInt(256) << 16) | (r.nextInt(256) << 8) | r.nextInt(256); break;
+                        case 4: v = grey(x * 255 / (w - 1)); break;
+                        case 5: v = grey(y * 255 / (h - 1)); break;
+                        case 6: v = grey(255 - y * 255 / (h - 1)); break;
+                        case 7: v = grey(y * 255 / (h - 1)); break;
+                        case 8: v = ((x / 6 + y / 6) % 2 == 0) ? grey(255) : grey(20); break;
+                        case 9: v = new int[] { 0xFF0000, 0x00FF00, 0xFFFF00, 0x00FFFF, 0xFF00FF }[(x / 10) % 5]; break;
+                        default: v = ((255 - y * 3 / 2) << 16) | ((140 - y) << 8) | (80 + x); break;
+                    }
+                    px[y * w + x] = 0xFF000000 | (v & 0xFFFFFF);
+                }
+            }
+            double[] bands = Scrim.bandLuminance(px, w, h, Scrim.BANDS, Scrim.PERCENTILE);
+            for (int dim : new int[] { 0, 40, 100 }) {
+                float[] st = Scrim.stops(bands, dim);
+                int ok45 = 0, ok30 = 0, okMain = 0;
+                for (int y = 0; y < h; y++) {
+                    double a = Scrim.alphaAt(st, (y + 0.5) / h);
+                    for (int x = 0; x < w; x++) {
+                        int shown = Scrim.blend(Scrim.BASE, a, px[y * w + x] & 0xFFFFFF);
+                        double lum = Scrim.luminance(shown);
+                        double c = Scrim.contrast(Scrim.luminance(Scrim.DIM_TEXT), lum);
+                        if (c >= 4.5) ok45++;
+                        if (c >= 3.0) ok30++;
+                        if (Scrim.contrast(Scrim.luminance(Scrim.TEXT), lum) >= 4.5) okMain++;
+                    }
+                }
+                double total = w * h;
+                check(ok45 / total >= 0.94, names[n] + " dim " + dim + ": " + (100 * ok45 / total) + "% of pixels meet 4.5:1");
+                check(ok30 / total >= 0.985, names[n] + " dim " + dim + ": " + (100 * ok30 / total) + "% meet 3:1");
+                check(okMain / total >= 0.99, names[n] + " dim " + dim + ": main text readable");
+            }
+        }
+    }
+
+    static void scrimHelpers() {
+        String[] in = { "40", " 75\n", "150", "-5", "abc", "", null, "50.5", "0", "100", "  " };
+        int[] want = { 40, 75, 100, 0, 40, 40, 40, 40, 0, 100, 40 };
+        for (int i = 0; i < in.length; i++) check(Scrim.parseDim(in[i]) == want[i], "parseDim(" + in[i] + ")");
+        check(Scrim.sampleSize(4000, 3000, 1920, 1080) == 2, "sample 4000x3000");
+        check(Scrim.sampleSize(3840, 2160, 1920, 1080) == 2, "sample 4K");
+        check(Scrim.sampleSize(1920, 1080, 1920, 1080) == 1, "sample 1080p");
+        check(Scrim.sampleSize(1000, 500, 1920, 1080) == 1, "small picture not upscaled");
+        check(Scrim.sampleSize(8000, 6000, 1920, 1080) == 4, "sample 8000x6000");
+        check(Scrim.sampleSize(0, 0, 1920, 1080) == 1, "sample zero");
+        Random r = new Random(5);
+        for (int i = 0; i < 3000; i++) {
+            int sw = 100 + r.nextInt(9000), sh = 100 + r.nextInt(9000), dw = 640 + r.nextInt(3200);
+            int dh = Math.max(1, (int) (dw / (1.3 + r.nextDouble() * 1.1)));
+            int s = Scrim.sampleSize(sw, sh, dw, dh);
+            check(s >= 1 && (s & (s - 1)) == 0, "power of two");
+            if (sw >= dw && sh >= dh) check(sw / s >= dw && sh / s >= dh, "decoded picture still covers the screen");
+            int[] c = Scrim.centerCrop(sw, sh, dw, dh);
+            check(c[0] >= 0 && c[1] >= 0 && c[2] > 0 && c[3] > 0 && c[0] + c[2] <= sw && c[1] + c[3] <= sh, "crop inside picture");
+            double asp = (double) dw / dh;       // integer truncation can only shift the shape by this much
+            check(Math.abs((double) c[2] / c[3] - asp) <= (asp + 1.0) / c[3] + 1e-9, "crop matches screen shape");
+            check(Math.abs(c[0] - (sw - c[0] - c[2])) <= 1 && Math.abs(c[1] - (sh - c[1] - c[3])) <= 1, "crop is centred");
+        }
+        int[] c = Scrim.centerCrop(4000, 3000, 1920, 1080);
+        check(c[0] == 0 && c[1] == 375 && c[2] == 4000 && c[3] == 2250, "known crop");
+        check(Scrim.centerCrop(0, 0, 10, 10)[2] >= 1, "degenerate crop");
+    }
+
     public static void main(String[] args) {
         gridSweep();
         pins();
         ordering();
         comparatorContract();
+        scrimMaths();
+        scrimAnalysis();
+        scrimStops();
+        scrimEndToEnd();
+        scrimHelpers();
         System.out.println("Java unit tests passed (" + checks + " checks)");
     }
 }

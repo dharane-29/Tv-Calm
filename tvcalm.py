@@ -11,6 +11,8 @@ Needs `adb` (Android platform-tools) on your PATH or in ANDROID_HOME.
   python tvcalm.py tune     <tv-ip> [--apply]  animations, screensaver, sleep timer
   python tvcalm.py restore  <tv-ip>            revert every recorded change
   python tvcalm.py undo     <tv-ip>            stock home screen back, launcher removed
+  python tvcalm.py wallpaper <tv-ip> <picture> [--dim 0-100]   put your own picture behind the apps
+  python tvcalm.py wallpaper <tv-ip> --remove  go back to the plain dark background
   python tvcalm.py lockdown <tv-ip>            turn debugging off when you're done
   python tests/run_all.py                      run every test (needs JDK for the Java tests)
 
@@ -30,6 +32,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -38,6 +41,8 @@ from pathlib import Path
 
 PKG = "app.calmhome"
 ACT = PKG + "/.MainActivity"
+WALL_DIR = f"/sdcard/Android/data/{PKG}/files"      # the app's own folder; no permission needed
+WALL_MAX_BYTES = 30 * 1024 * 1024
 ROOT = Path(__file__).resolve().parent
 STATE = Path.home() / ".tvcalm"
 
@@ -566,6 +571,94 @@ def cmd_undo(a):
     print("Stock home screen restored and Calm Home removed.")
 
 
+def image_info(data: bytes):
+    """Return (kind, width, height) for JPEG/PNG/WebP, or (None, None, None) if unsupported.
+    Width/height are None when they can't be read cheaply (WebP)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        w, h = struct.unpack(">II", data[16:24])
+        return "png", w, h
+    if data[:3] == b"\xff\xd8\xff":
+        pos = 2
+        while pos + 9 < len(data):
+            if data[pos] != 0xFF:
+                pos += 1
+                continue
+            marker = data[pos + 1]
+            if marker == 0xFF:
+                pos += 1
+                continue
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                pos += 2
+                continue
+            seg = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[pos + 5:pos + 9])
+                return "jpeg", w, h
+            pos += 2 + seg
+        return "jpeg", None, None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp", None, None
+    return None, None, None
+
+
+def cmd_wallpaper(a):
+    tv = TV(a.target)
+    if "package:" + PKG not in tv.sh(f"pm list packages {PKG}"):
+        die("Calm Home isn't installed on this TV yet. Run the `install` step first.")
+    if a.remove:
+        tv.sh(f"rm -f {WALL_DIR}/wallpaper.img {WALL_DIR}/wallpaper.cfg {WALL_DIR}/wallpaper.tmp")
+        tv.sh(f"am start -n {ACT}")
+        print("Wallpaper removed. Back to the plain dark background.")
+        return
+    if not a.image:
+        die("Tell me which picture to use, for example:\n"
+            f'  python tvcalm.py wallpaper {a.target} "C:\\Users\\you\\Pictures\\space.jpg"')
+    path = Path(a.image.strip('"'))
+    if not path.is_file():
+        die(f"I can't find the file: {path}\nTip: drag the picture into this window to paste its full path.")
+    if not 0 <= a.dim <= 100:
+        die("--dim must be a number from 0 (lightest) to 100 (darkest).")
+    size = path.stat().st_size
+    if size > WALL_MAX_BYTES:
+        die(f"That picture is {size / 1048576:.0f} MB. Please use one under 30 MB (a normal JPG is fine).")
+    with open(path, "rb") as f:
+        head = f.read(1 << 20)
+    kind, w, h = image_info(head)
+    if kind is None:
+        die("That doesn't look like a JPG, PNG or WebP picture. Phone formats like HEIC or AVIF aren't "
+            "supported; open the picture and save/export it as JPG first.")
+    if w and h:
+        print(f"Picture: {kind.upper()} {w}x{h}")
+        if w < 1280 or h < 720:
+            print("note: this picture is smaller than 1280x720 and may look soft on a big TV. "
+                  "A 1920x1080 or larger picture looks best.")
+        if h > w:
+            print("note: this is a tall (portrait) picture; only a wide slice of it will show on the TV.")
+
+    tv.sh(f"am start -n {ACT}")      # makes sure the app's own folder exists
+    time.sleep(2)
+    tv.sh(f"mkdir -p {WALL_DIR}")
+    tmp, final = f"{WALL_DIR}/wallpaper.tmp", f"{WALL_DIR}/wallpaper.img"
+    rc, out, err = tv.raw("push", str(path), tmp, timeout=300)
+    if rc != 0:      # fallback: some TVs only allow pushing to a neutral folder, then copying
+        stage = "/data/local/tmp/calm-wallpaper.tmp"
+        rc, out, err = tv.raw("push", str(path), stage, timeout=300)
+        if rc != 0:
+            die("Couldn't copy the picture to the TV: " + (err or out))
+        rc2, out2 = tv.sh_rc(f"cat {stage} > {tmp}")
+        tv.sh(f"rm -f {stage}")
+        if rc2 != 0:
+            die("The TV wouldn't let me write into Calm Home's folder: " + out2)
+    tv.sh(f"echo {a.dim} > {WALL_DIR}/wallpaper.cfg")
+    tv.sh(f"mv {tmp} {final}")
+    if "wallpaper.img" not in tv.sh(f"ls {final}") or "No such file" in tv.sh(f"ls {final}"):
+        die("The picture didn't arrive on the TV. Nothing was changed.")
+    tv.sh(f"am start -n {ACT}")
+    print(f"Done. Your wallpaper is set (darkness {a.dim}/100). Look at the TV.")
+    print("If the picture is hard to see, run this again with a smaller --dim (for example --dim 20).")
+    print("If the text is hard to read, use a bigger one (for example --dim 70).")
+
+
 def cmd_lockdown(a):
     tv = TV(a.target)
     if not ask("Turn off ADB on the TV? (re-enable it in Developer options to use this tool again)"):
@@ -698,6 +791,10 @@ def main(argv=None):
     s = add("restore", cmd_restore, help="revert recorded changes")
     s.add_argument("--kind", choices=["debloat", "tune", "launcher"])
     s.add_argument("--snapshot", help="path to a specific snapshot file")
+    s = add("wallpaper", cmd_wallpaper, help="use your own picture behind the apps")
+    s.add_argument("image", nargs="?", help="path to a JPG, PNG or WebP picture")
+    s.add_argument("--dim", type=int, default=40, help="darkness 0-100 (default 40)")
+    s.add_argument("--remove", action="store_true", help="remove the wallpaper")
     add("undo", cmd_undo, help="stock home back, launcher removed")
     add("lockdown", cmd_lockdown, help="turn ADB off")
 

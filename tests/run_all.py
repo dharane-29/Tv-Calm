@@ -12,6 +12,7 @@ def java_tests() -> bool:
         return True
     out = tempfile.mkdtemp()
     src = [str(ROOT / "app/src/app/calmhome/Grid.java"), str(ROOT / "app/src/app/calmhome/Order.java"),
+           str(ROOT / "app/src/app/calmhome/Scrim.java"),
            str(ROOT / "tests/java/app/calmhome/UnitTests.java")]
     for cmd in (["javac", "-Xlint:-options", "--release", "8", "-d", out, *src],
                 ["java", "-cp", out, "app.calmhome.UnitTests"]):

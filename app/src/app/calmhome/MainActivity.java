@@ -9,7 +9,13 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
+import android.graphics.Paint;
+import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
@@ -39,6 +45,8 @@ import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileInputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -60,13 +68,55 @@ public class MainActivity extends Activity {
     private static final String KEY_SETTINGS = "__settings__";
     private static final String KEY_HIDDEN = "__hidden__";
 
-    private static final int BG = 0xFF0D1117;
+    private static final int BG = Scrim.BASE;
     private static final int CARD = 0xFF1A2029;
-    private static final int TEXT = 0xFFE6EDF3;
-    private static final int DIM = 0xFF8B949E;
+    private static final int TEXT = Scrim.TEXT;
+    private static final int DIM = Scrim.DIM_TEXT;
     private static final int ACCENT = 0xFF58A6FF;
 
     private static final int SCREEN_MARGIN_DP = 56;   // TV overscan-safe side margin
+
+    /** A decoded wallpaper plus the darkening gradient computed for it. */
+    private static final class Wall {
+        Bitmap bitmap;
+        float[] alphas;
+        String stamp;
+    }
+
+    /** Draws the soft dark gradient over the wallpaper. */
+    private static final class ScrimView extends View {
+        private final Paint paint = new Paint();
+        private float[] alphas;
+        private int builtForHeight = -1;
+
+        ScrimView(Context c) {
+            super(c);
+            setFocusable(false);
+        }
+
+        void setAlphas(float[] a) {
+            alphas = a;
+            builtForHeight = -1;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            if (alphas == null || getHeight() <= 0) return;
+            if (builtForHeight != getHeight()) {
+                int n = alphas.length;
+                int[] colors = new int[n];
+                float[] pos = new float[n];
+                for (int i = 0; i < n; i++) {
+                    colors[i] = Color.argb(Math.round(alphas[i] * 255f), 0x0D, 0x11, 0x17);
+                    pos[i] = i / (float) (n - 1);
+                }
+                paint.setShader(new LinearGradient(0, 0, 0, getHeight(), colors, pos, Shader.TileMode.CLAMP));
+                builtForHeight = getHeight();
+            }
+            canvas.drawRect(0, 0, getWidth(), getHeight(), paint);
+        }
+    }
 
     private static class Item implements Order.Entry {
         String key;
@@ -88,6 +138,10 @@ public class MainActivity extends Activity {
     private float dp;
     private int generation;
     private Grid grid;
+    private ImageView wallpaperView;
+    private ScrimView scrimView;
+    private String shownWallStamp;
+    private volatile Wall wallCache;
 
     private View firstTile;
     private final Map<String, View> tileByKey = new HashMap<String, View>();
@@ -103,6 +157,18 @@ public class MainActivity extends Activity {
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(BG);
+
+        // Optional wallpaper (hidden until the user adds one) with a dark gradient over it.
+        wallpaperView = new ImageView(this);
+        wallpaperView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        wallpaperView.setFocusable(false);
+        wallpaperView.setVisibility(View.GONE);
+        root.addView(wallpaperView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        scrimView = new ScrimView(this);
+        scrimView.setVisibility(View.GONE);
+        root.addView(scrimView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
@@ -141,6 +207,7 @@ public class MainActivity extends Activity {
         // Home pressed while already on the home screen: jump back to the top.
         scroll.scrollTo(0, 0);
         if (firstTile != null) firstTile.requestFocus();
+        reload();
     }
 
     @Override
@@ -200,10 +267,11 @@ public class MainActivity extends Activity {
         final int mine = ++generation;
         new Thread(new Runnable() {
             @Override public void run() {
+                final Wall wall = loadWall();
                 final List<Item> all = loadAll();
                 ui.post(new Runnable() {
                     @Override public void run() {
-                        if (mine == generation && !isFinishing() && !isDestroyed()) render(all);
+                        if (mine == generation && !isFinishing() && !isDestroyed()) render(all, wall);
                     }
                 });
             }
@@ -266,6 +334,95 @@ public class MainActivity extends Activity {
         return out;
     }
 
+    /**
+     * Reads the user's wallpaper from the app's own folder on shared storage (no permission
+     * needed): Android/data/app.calmhome/files/wallpaper.img, plus an optional wallpaper.cfg
+     * holding the "dim" setting 0-100. Returns null when there is none or it can't be read.
+     */
+    private Wall loadWall() {
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir == null) { wallCache = null; return null; }
+            File img = new File(dir, "wallpaper.img");
+            File cfg = new File(dir, "wallpaper.cfg");
+            if (!img.isFile() || img.length() == 0) { wallCache = null; return null; }
+            String stamp = img.lastModified() + ":" + img.length() + ":"
+                    + (cfg.isFile() ? cfg.lastModified() + ":" + cfg.length() : "none");
+            Wall cached = wallCache;
+            if (cached != null && cached.stamp.equals(stamp)) return cached;
+
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(img.getPath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+
+            int screenW = getResources().getDisplayMetrics().widthPixels;
+            int screenH = getResources().getDisplayMetrics().heightPixels;
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = Scrim.sampleSize(bounds.outWidth, bounds.outHeight,
+                    Math.min(screenW, 1920), Math.min(screenH, 1080));
+            opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            Bitmap bmp = BitmapFactory.decodeFile(img.getPath(), opts);
+            if (bmp == null) return null;
+
+            // Measure the part of the picture that is actually visible (centre crop).
+            int[] crop = Scrim.centerCrop(bmp.getWidth(), bmp.getHeight(), screenW, screenH);
+            Bitmap visible = Bitmap.createBitmap(bmp, crop[0], crop[1], crop[2], crop[3]);
+            int sw = 96;
+            int sh = Math.max(8, Math.round(sw * (float) crop[3] / crop[2]));
+            Bitmap small = Bitmap.createScaledBitmap(visible, sw, sh, true);
+            int[] px = new int[sw * sh];
+            small.getPixels(px, 0, sw, 0, 0, sw, sh);
+            double[] bands = Scrim.bandLuminance(px, sw, sh, Scrim.BANDS, Scrim.PERCENTILE);
+
+            Wall w = new Wall();
+            w.bitmap = bmp;
+            w.alphas = Scrim.stops(bands, Scrim.parseDim(readSmallFile(cfg)));
+            w.stamp = stamp;
+            wallCache = w;
+            return w;
+        } catch (Throwable t) {          // corrupt picture, out of memory, ...: plain background
+            wallCache = null;
+            return null;
+        }
+    }
+
+    private static String readSmallFile(File f) {
+        if (f == null || !f.isFile() || f.length() > 64) return null;
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream(f);
+            byte[] buf = new byte[64];
+            int n = in.read(buf);
+            return n > 0 ? new String(buf, 0, n, "UTF-8") : null;
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (in != null) {
+                try { in.close(); } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    private void applyWall(Wall wall) {
+        if (wall == null) {
+            if (shownWallStamp != null) {
+                wallpaperView.setImageDrawable(null);
+                wallpaperView.setVisibility(View.GONE);
+                scrimView.setVisibility(View.GONE);
+                shownWallStamp = null;
+            }
+            return;
+        }
+        if (!wall.stamp.equals(shownWallStamp)) {
+            wallpaperView.setImageBitmap(wall.bitmap);
+            scrimView.setAlphas(wall.alphas);
+            wallpaperView.setVisibility(View.VISIBLE);
+            scrimView.setVisibility(View.VISIBLE);
+            shownWallStamp = wall.stamp;
+        }
+    }
+
     /** The name the user gave an input (e.g. "Game console"); the API only exists on newer TVs. */
     private CharSequence customLabel(TvInputInfo info) {
         if (Build.VERSION.SDK_INT < 26) return null;
@@ -279,7 +436,8 @@ public class MainActivity extends Activity {
 
     // --------------------------------------------------------------- rendering
 
-    private void render(List<Item> all) {
+    private void render(List<Item> all, Wall wall) {
+        applyWall(wall);
         View focused = getCurrentFocus();
         String refocusKey = null;
         if (focused != null && focused.getTag() instanceof Item) {

@@ -7,9 +7,11 @@ import json
 import os
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -433,6 +435,226 @@ class TestRestoreAndLockdown(Base):
         self.ask_answer = False
         self.tv("lockdown", IP)
         self.assertFalse(self.st()["scenario"]["adb_off"])
+
+
+def make_png(w, h):
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + b"\x20\x30\x40" * w for _ in range(min(h, 4)))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def make_jpeg(w, h, sof=0xC0):
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    comment = b"\xff\xfe" + struct.pack(">H", 12) + b"x" * 10          # a segment that must be skipped
+    dht = b"\xff\xc4" + struct.pack(">H", 6) + b"\x00\x01\x02\x03"      # DHT looks like SOF but isn't
+    sofseg = bytes([0xFF, sof]) + struct.pack(">HBHHB", 17, 8, h, w, 3) + b"\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    return b"\xff\xd8" + app0 + comment + dht + sofseg + b"\xff\xd9"
+
+
+class TestImageInfo(unittest.TestCase):
+    def test_png(self):
+        self.assertEqual(tvcalm.image_info(make_png(1920, 1080)), ("png", 1920, 1080))
+
+    def test_jpeg_variants(self):
+        for sof in (0xC0, 0xC1, 0xC2):          # baseline, extended, progressive
+            self.assertEqual(tvcalm.image_info(make_jpeg(3840, 2160, sof)), ("jpeg", 3840, 2160))
+
+    def test_webp_and_junk(self):
+        self.assertEqual(tvcalm.image_info(b"RIFF\x00\x00\x00\x00WEBPVP8 ")[0], "webp")
+        for junk in (b"", b"hello world, not a picture", b"\x89PNG", b"\xff\xd8", b"GIF89a....", b"\x00" * 64,
+                     b"ftypheic" + b"\x00" * 40):
+            self.assertIsNone(tvcalm.image_info(junk)[0], junk[:10])
+
+    def test_truncated_jpeg_does_not_crash(self):
+        self.assertEqual(tvcalm.image_info(make_jpeg(100, 100)[:12])[0], "jpeg")
+
+
+class TestWallpaper(Base):
+    DIR = tvcalm.WALL_DIR
+
+    def setUp(self):
+        super().setUp()
+        self.init(takeover="direct")
+        st = self.st(); st["installed"] = True
+        self.state.write_text(json.dumps(st))
+        tvcalm.time.sleep, self._sleep = (lambda s: None), tvcalm.time.sleep
+
+    def tearDown(self):
+        tvcalm.time.sleep = self._sleep
+        super().tearDown()
+
+    def pic(self, name="space.png", data=None):
+        p = self.tmp / name
+        p.write_bytes(data if data is not None else make_png(1920, 1080))
+        return str(p)
+
+    def files(self):
+        return self.st().get("files", {})
+
+    def test_not_installed(self):
+        st = self.st(); st["installed"] = False
+        self.state.write_text(json.dumps(st))
+        code, _, err = self.tv("wallpaper", IP, self.pic())
+        self.assertNotEqual(code, 0)
+        self.assertIn("install", err)
+        self.assertEqual(self.files(), {})
+
+    def test_success_png(self):
+        code, out, err = self.tv("wallpaper", IP, self.pic())
+        self.assertEqual(code, 0, err)
+        f = self.files()
+        self.assertEqual(f[self.DIR + "/wallpaper.img"], "pushed:space.png")
+        self.assertEqual(f[self.DIR + "/wallpaper.cfg"], "cfg:40")
+        self.assertNotIn(self.DIR + "/wallpaper.tmp", f)               # temp file renamed away
+        self.assertGreaterEqual(self.st()["started"], 2)                 # app brought to the front
+        self.assertIn("Picture: PNG 1920x1080", out)
+
+    def test_custom_dim(self):
+        code, _, _ = self.tv("wallpaper", IP, self.pic(), "--dim", "75")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.files()[self.DIR + "/wallpaper.cfg"], "cfg:75")
+
+    def test_dim_out_of_range(self):
+        for bad in ("-1", "101", "500"):
+            code, _, err = self.tv("wallpaper", IP, self.pic(), "--dim", bad)
+            self.assertNotEqual(code, 0, bad)
+            self.assertIn("--dim", err)
+        self.assertEqual(self.files(), {})
+
+    def test_replace_existing(self):
+        self.tv("wallpaper", IP, self.pic("one.png"))
+        self.tv("wallpaper", IP, self.pic("two.png"), "--dim", "10")
+        self.assertEqual(self.files()[self.DIR + "/wallpaper.img"], "pushed:two.png")
+        self.assertEqual(self.files()[self.DIR + "/wallpaper.cfg"], "cfg:10")
+
+    def test_missing_file(self):
+        code, _, err = self.tv("wallpaper", IP, str(self.tmp / "nope.jpg"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("can't find", err)
+
+    def test_no_picture_given(self):
+        code, _, err = self.tv("wallpaper", IP)
+        self.assertNotEqual(code, 0)
+        self.assertIn("Tell me which picture", err)
+
+    def test_not_a_picture(self):
+        for name, data in (("a.jpg", b"this is text pretending to be a jpg"), ("b.jpg", b"ftypheic" + b"\0" * 100),
+                           ("c.jpg", b"")):
+            code, _, err = self.tv("wallpaper", IP, self.pic(name, data))
+            self.assertNotEqual(code, 0, name)
+            self.assertIn("JPG, PNG or WebP", err)
+        self.assertEqual(self.files(), {})
+
+    def test_too_big(self):
+        p = self.tmp / "huge.png"
+        with open(p, "wb") as f:
+            f.write(make_png(100, 100))
+            f.truncate(tvcalm.WALL_MAX_BYTES + 1)
+        code, _, err = self.tv("wallpaper", IP, str(p))
+        self.assertNotEqual(code, 0)
+        self.assertIn("under 30 MB", err)
+        self.assertEqual(self.files(), {})
+
+    def test_quotes_around_path_tolerated(self):
+        code, _, err = self.tv("wallpaper", IP, '"' + self.pic() + '"')
+        self.assertEqual(code, 0, err)
+
+    def test_small_and_portrait_warnings(self):
+        code, out, _ = self.tv("wallpaper", IP, self.pic("small.jpg", make_jpeg(640, 480)))
+        self.assertEqual(code, 0)
+        self.assertIn("smaller than 1280x720", out)
+        code, out, _ = self.tv("wallpaper", IP, self.pic("tall.png", make_png(1080, 1920)))
+        self.assertEqual(code, 0)
+        self.assertIn("portrait", out)
+        code, out, _ = self.tv("wallpaper", IP, self.pic("webp.webp", b"RIFF\0\0\0\0WEBPVP8 " + b"\0" * 64))
+        self.assertEqual(code, 0)                       # size unknown for WebP: no warning, still fine
+
+    def test_fallback_route_when_direct_push_is_refused(self):
+        self.init(push_direct_fails=True)
+        code, out, err = self.tv("wallpaper", IP, self.pic())
+        self.assertEqual(code, 0, err)
+        f = self.files()
+        self.assertIn(self.DIR + "/wallpaper.img", f)
+        self.assertFalse([k for k in f if k.startswith("/data/local/tmp")])   # staging file cleaned up
+
+    def test_total_copy_failure_changes_nothing(self):
+        self.init(push_all_fail=True)
+        code, _, err = self.tv("wallpaper", IP, self.pic())
+        self.assertNotEqual(code, 0)
+        self.assertIn("Couldn't copy", err)
+        self.assertNotIn(self.DIR + "/wallpaper.img", self.files())
+
+    def test_remove(self):
+        self.tv("wallpaper", IP, self.pic())
+        code, out, _ = self.tv("wallpaper", IP, "--remove")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.files(), {})
+        self.assertIn("removed", out)
+        code, _, _ = self.tv("wallpaper", IP, "--remove")      # removing twice is harmless
+        self.assertEqual(code, 0)
+
+
+class TestPngReader(unittest.TestCase):
+    """The smoke test reads screenshot pixels; make sure the reader is right for every PNG filter."""
+
+    @staticmethod
+    def encode(rows, w, bpp):
+        out = bytearray()
+        prev = bytearray(w * bpp)
+        for y, row in enumerate(rows):
+            ft = y % 5
+            line = bytearray()
+            for i in range(w * bpp):
+                a = row[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                if ft == 0:
+                    pred = 0
+                elif ft == 1:
+                    pred = a
+                elif ft == 2:
+                    pred = b
+                elif ft == 3:
+                    pred = (a + b) >> 1
+                else:
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line.append((row[i] - pred) & 255)
+            out += bytes([ft]) + line
+            prev = bytearray(row)
+        def chunk(tag, data):
+            body = tag + data
+            return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        ctype = 2 if bpp == 3 else 6
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, len(rows), 8, ctype, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(out))) + chunk(b"IEND", b""))
+
+    def test_all_filters_roundtrip(self):
+        import random
+        sys.path.insert(0, str(HERE))
+        import pngpx
+        rnd = random.Random(3)
+        for bpp in (3, 4):
+            w, h = 23, 17
+            rows = [bytes(rnd.randrange(256) for _ in range(w * bpp)) for _ in range(h)]
+            png = self.encode(rows, w, bpp)
+            ww, hh, got, gb = pngpx.decode(png)
+            self.assertEqual((ww, hh, gb), (w, h, bpp))
+            self.assertEqual(got, rows)
+
+    def test_average_and_errors(self):
+        import pngpx
+        rows = [bytes([200, 40, 40] * 8) for _ in range(8)]
+        path = Path(tempfile.mkdtemp()) / "red.png"
+        path.write_bytes(self.encode(rows, 8, 3))
+        self.assertEqual(pngpx.average(str(path), 4, 4, 2), (200, 40, 40))
+        self.assertEqual(pngpx.average(str(path), 0, 0, 50), (200, 40, 40))     # radius clipped at edges
+        with self.assertRaises(ValueError):
+            pngpx.decode(b"nope")
 
 
 class TestCli(unittest.TestCase):
