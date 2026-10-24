@@ -10,7 +10,7 @@ Observed output shown below is an **example from the 20 October 2026 session**
 
 | Layer | Proves | Does not prove |
 | --- | --- | --- |
-| Java unit tests | Grid maths, sorting, and the wallpaper-darkening maths are correct across many screen sizes and picture types. | Anything about Android itself. |
+| Java unit tests | Grid maths, sorting, the wallpaper-darkening maths, the contrast of every colour pair in the design, and the geometry of the drawn icons are correct. | Anything about Android itself, or how the screen actually looks (spacing, fonts). |
 | Python tests (simulated TV) | The toolkit's logic: safety rules, dry runs, rollback, snapshots, restore, install/takeover paths, wallpaper command. Also the **smoke script's own logic**: it is run against a simulated device, including scenarios that must make it fail (wrong screen pixel, crash in the log, dead process, extra permission) or report "not exercised". | Real adb or real Android behaviour; they talk to a fake. |
 | APK build | The app compiles, signs, has zero permissions. | That it behaves well on a screen. |
 | Emulator smoke test | The app installs, launches, draws its tiles and clock, reacts to remote keys, shows/removes a wallpaper (checked by reading screen pixels), and can be undone, on an Android TV emulator. | Any physical TV, vendor firmware, HDMI inputs, or applying debloat (unless `SMOKE_DEBLOAT=1`). |
@@ -41,9 +41,9 @@ Expected ending (example from the author's Linux environment):
 
 ```text
 ==================== SUMMARY ====================
-PASS  Java unit tests: Java unit tests passed (220263 checks)
-PASS  Python tests, normal adb output: 88 tests, 0 skipped
-PASS  Python tests, Windows-style CRLF adb output: 88 tests, 0 skipped
+PASS  Java unit tests: Java unit tests passed (220516 checks)
+PASS  Python tests, normal adb output: 91 tests, 0 skipped
+PASS  Python tests, Windows-style CRLF adb output: 91 tests, 0 skipped
 =================================================
 RESULT: PASSED
 ```
@@ -52,7 +52,7 @@ RESULT: PASSED
 run. Common legitimate skips: no JDK installed; no Android SDK for the real-build test; no
 `bash` for the shell-helper tests.
 
-The 220,263 figure is the number of assertions ("checks") inside the Java test program.
+The 220,516 figure is the number of assertions ("checks") inside the Java test program.
 
 The full run takes a few minutes (about 4 on the author's Linux machine): each Python pass includes
 ten runs of the real smoke script against a simulated device. Those use `SMOKE_FAST=1`, a

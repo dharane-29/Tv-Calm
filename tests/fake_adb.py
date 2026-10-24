@@ -3,12 +3,14 @@
 import json, os, sys
 
 if os.environ.get("FAKE_ADB_CRLF"):
-    # Real adb on Windows ends every output line with \r\n. Simulate that.
-    _real_print = print
-
+    # Real adb on Windows ends every output line with \r\n. Simulate that. Bytes are written
+    # directly so Windows text mode cannot turn \r\n into \r\r\n by accident.
     def print(*args, **kw):  # noqa: A001
-        text = " ".join(str(a) for a in args).replace("\n", "\r\n")
-        _real_print(text, end=kw.get("end", "\r\n"), file=kw.get("file", sys.stdout))
+        f = kw.get("file", sys.stdout)
+        text = " ".join(str(a) for a in args).replace("\n", "\r\n") + kw.get("end", "\r\n")
+        f.flush()
+        getattr(f, "buffer", f).write(text.encode("utf-8"))
+        f.flush()
 
 S = os.environ["FAKE_ADB_STATE"]
 DEFAULT = {

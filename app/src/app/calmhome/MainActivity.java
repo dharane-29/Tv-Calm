@@ -13,6 +13,10 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorFilter;
+import android.graphics.PixelFormat;
+import android.graphics.Path;
+import android.graphics.Rect;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Shader;
@@ -31,12 +35,14 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.text.format.DateFormat;
 import android.content.res.Configuration;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
+import android.view.Window;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -68,11 +74,9 @@ public class MainActivity extends Activity {
     private static final String KEY_SETTINGS = "__settings__";
     private static final String KEY_HIDDEN = "__hidden__";
 
-    private static final int BG = Scrim.BASE;
-    private static final int CARD = 0xFF1A2029;
-    private static final int TEXT = Scrim.TEXT;
-    private static final int DIM = Scrim.DIM_TEXT;
-    private static final int ACCENT = 0xFF58A6FF;
+    private static final int BG = Theme.BG;
+    private static final int TEXT = Theme.TEXT;
+    private static final int DIM = Theme.DIM;
 
     private static final int SCREEN_MARGIN_DP = 56;   // TV overscan-safe side margin
 
@@ -81,6 +85,52 @@ public class MainActivity extends Activity {
         Bitmap bitmap;
         float[] alphas;
         String stamp;
+    }
+
+    /** Draws a Glyph (pure geometry in a 0..1 box) with a Canvas. */
+    private static final class GlyphDrawable extends Drawable {
+        private final List<Glyph.Prim> shapes;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+
+        GlyphDrawable(Glyph.Kind kind, int color) {
+            shapes = Glyph.shapes(kind);
+            paint.setColor(color);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+        }
+
+        @Override
+        public void draw(Canvas c) {
+            Rect b = getBounds();
+            float size = Math.min(b.width(), b.height());
+            float ox = b.left + (b.width() - size) / 2f;
+            float oy = b.top + (b.height() - size) / 2f;
+            for (Glyph.Prim sh : shapes) {
+                paint.setStyle(sh.fill ? Paint.Style.FILL : Paint.Style.STROKE);
+                paint.setStrokeWidth((float) (sh.width * size));
+                if (sh.type == Glyph.POLY) {
+                    path.reset();
+                    for (int i = 0; i + 1 < sh.p.length; i += 2) {
+                        float x = ox + (float) sh.p[i] * size, y = oy + (float) sh.p[i + 1] * size;
+                        if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
+                    }
+                    if (sh.closed) path.close();
+                    c.drawPath(path, paint);
+                } else if (sh.type == Glyph.CIRCLE) {
+                    c.drawCircle(ox + (float) sh.p[0] * size, oy + (float) sh.p[1] * size,
+                            (float) sh.p[2] * size, paint);
+                } else {
+                    c.drawLine(ox + (float) sh.p[0] * size, oy + (float) sh.p[1] * size,
+                            ox + (float) sh.p[2] * size, oy + (float) sh.p[3] * size, paint);
+                }
+            }
+        }
+
+        @Override public void setAlpha(int alpha) { paint.setAlpha(alpha); }
+        @Override public void setColorFilter(ColorFilter cf) { paint.setColorFilter(cf); }
+        @SuppressWarnings("deprecation")      // still abstract on the oldest supported Android (5.0)
+        @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
     }
 
     /** Draws the soft dark gradient over the wallpaper. */
@@ -121,7 +171,7 @@ public class MainActivity extends Activity {
     private static class Item implements Order.Entry {
         String key;
         String label;
-        String badge;      // text shown instead of artwork (HDMI, Settings...)
+        Glyph.Kind glyph;  // drawn icon shown instead of artwork (HDMI, Settings, Hidden)
         Drawable art;      // banner or icon
         boolean banner;    // true: art fills the card; false: art is a centred icon
         boolean input;
@@ -140,6 +190,7 @@ public class MainActivity extends Activity {
     private Grid grid;
     private ImageView wallpaperView;
     private ScrimView scrimView;
+    private TextView ampmClock;
     private String shownWallStamp;
     private volatile Wall wallCache;
 
@@ -157,6 +208,7 @@ public class MainActivity extends Activity {
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(BG);
+        root.setClipChildren(false);
 
         // Optional wallpaper (hidden until the user adds one) with a dark gradient over it.
         wallpaperView = new ImageView(this);
@@ -173,6 +225,7 @@ public class MainActivity extends Activity {
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
         // TV overscan-safe margins.
+        column.setClipChildren(false);
         column.setPadding(px(SCREEN_MARGIN_DP), px(28), px(SCREEN_MARGIN_DP), 0);
         column.addView(buildHeader());
 
@@ -180,7 +233,9 @@ public class MainActivity extends Activity {
         scroll.setVerticalScrollBarEnabled(false);
         scroll.setClipChildren(false);
         scroll.setClipToPadding(false);
-        scroll.setPadding(0, px(12), 0, px(40));
+        scroll.setPadding(0, px(14), 0, px(40));
+        scroll.setVerticalFadingEdgeEnabled(true);        // rows fade softly as they scroll away
+        scroll.setFadingEdgeLength(px(Theme.FADE));
 
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
@@ -243,19 +298,35 @@ public class MainActivity extends Activity {
         header.setGravity(Gravity.BOTTOM);
 
         TextClock time = new TextClock(this);
-        time.setFormat12Hour("h:mm a");
+        time.setFormat12Hour("h:mm");
         time.setFormat24Hour("HH:mm");
-        time.setTextSize(44);
+        time.setTextSize(Theme.CLOCK_SP);
         time.setTextColor(TEXT);
         time.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
         header.addView(time);
 
+        TextClock ampm = new TextClock(this);            // hidden on 24-hour setups (see render)
+        ampm.setFormat12Hour("a");
+        ampm.setFormat24Hour("a");
+        ampm.setTextSize(Theme.AMPM_SP);
+        ampm.setTextColor(DIM);
+        ampm.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        ampm.setPadding(px(8), 0, 0, px(8));      // shares the clock's baseline
+        header.addView(ampm);
+        ampmClock = ampm;
+
+        View divider = new View(this);
+        divider.setBackgroundColor(Theme.HAIRLINE);
+        LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(px(1), px(28));
+        dp.setMargins(px(20), 0, px(20), px(11));
+        header.addView(divider, dp);
+
         TextClock date = new TextClock(this);
         date.setFormat12Hour("EEEE, d MMMM");
         date.setFormat24Hour("EEEE, d MMMM");
-        date.setTextSize(18);
+        date.setTextSize(Theme.DATE_SP);
         date.setTextColor(DIM);
-        date.setPadding(px(20), 0, 0, px(10));
+        date.setPadding(0, 0, 0, px(8));
         header.addView(date);
         return header;
     }
@@ -293,7 +364,7 @@ public class MainActivity extends Activity {
                     Item it = new Item();
                     it.key = "in:" + info.getId();
                     it.label = String.valueOf(label);
-                    it.badge = "HDMI";
+                    it.glyph = Glyph.Kind.HDMI;
                     it.input = true;
                     it.intent = new Intent(Intent.ACTION_VIEW,
                             TvContract.buildChannelUriForPassthroughInput(info.getId()))
@@ -438,6 +509,7 @@ public class MainActivity extends Activity {
 
     private void render(List<Item> all, Wall wall) {
         applyWall(wall);
+        ampmClock.setVisibility(DateFormat.is24HourFormat(this) ? View.GONE : View.VISIBLE);
         View focused = getCurrentFocus();
         String refocusKey = null;
         if (focused != null && focused.getTag() instanceof Item) {
@@ -465,11 +537,13 @@ public class MainActivity extends Activity {
             @Override public int launches(String key) { return 0; }
         });
 
+        final int appCount = apps.size();
+
         // Always-available system tiles go last.
         Item settings = new Item();
         settings.key = KEY_SETTINGS;
         settings.label = "Settings";
-        settings.badge = "SETTINGS";
+        settings.glyph = Glyph.Kind.SETTINGS;
         settings.intent = new Intent(Settings.ACTION_SETTINGS)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         apps.add(settings);
@@ -477,7 +551,7 @@ public class MainActivity extends Activity {
             Item h = new Item();
             h.key = KEY_HIDDEN;
             h.label = "Hidden (" + hiddenItems.size() + ")";
-            h.badge = "HIDDEN";
+            h.glyph = Glyph.Kind.HIDDEN;
             apps.add(h);
         }
 
@@ -489,10 +563,10 @@ public class MainActivity extends Activity {
         tileByKey.clear();
         firstTile = null;
         if (!inputs.isEmpty()) {
-            addSection("Inputs");
+            addSection("Inputs", inputs.size());
             addGrid(inputs, cols);
         }
-        addSection("Apps");
+        addSection("Apps", appCount);
         addGrid(apps, cols);
 
         View target = refocusKey != null ? tileByKey.get(refocusKey) : null;
@@ -500,14 +574,27 @@ public class MainActivity extends Activity {
         if (target != null) target.requestFocus();
     }
 
-    private void addSection(String title) {
+    private void addSection(String title, int count) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(px(10), px(20), px(10), px(8));
+
         TextView t = new TextView(this);
-        t.setText(title.toUpperCase());
+        t.setText(title.toUpperCase() + (count > 0 ? "  \u00b7  " + count : ""));
         t.setTextColor(DIM);
-        t.setTextSize(14);
+        t.setTextSize(Theme.SECTION_SP);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         t.setLetterSpacing(0.12f);
-        t.setPadding(px(10), px(18), 0, px(6));
-        content.addView(t);
+        row.addView(t);
+
+        View line = new View(this);
+        line.setBackgroundColor(Theme.HAIRLINE);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, px(1), 1f);
+        lp.setMargins(px(16), 0, 0, 0);
+        row.addView(line, lp);
+        content.addView(row, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
     }
 
     private void addGrid(List<Item> items, int cols) {
@@ -532,11 +619,13 @@ public class MainActivity extends Activity {
         tile.setClickable(true);
         tile.setLongClickable(true);
         tile.setTag(it);
+        tile.setClipChildren(false);
         tile.setPadding(px(Grid.PAD_DP), px(Grid.PAD_DP), px(Grid.PAD_DP), px(Grid.PAD_DP));
         tile.setBackground(focusBackground());
 
         FrameLayout art = new FrameLayout(this);
-        art.setBackground(rounded(CARD, 8, 0, 0));
+        art.setBackground(cardBackground());
+        art.setForeground(rounded(Color.TRANSPARENT, Theme.CARD_RADIUS, Theme.STROKE, Theme.STROKE_W));
         art.setClipToOutline(true);
         art.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
         if (it.art != null) {
@@ -550,35 +639,35 @@ public class MainActivity extends Activity {
             }
             art.addView(iv, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        } else {
-            TextView badge = new TextView(this);
-            badge.setText(it.badge == null ? "" : it.badge);
-            badge.setTextColor(DIM);
-            badge.setTextSize(16);
-            badge.setTypeface(Typeface.DEFAULT_BOLD);
-            badge.setLetterSpacing(0.15f);
-            badge.setGravity(Gravity.CENTER);
-            art.addView(badge, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        } else if (it.glyph != null) {
+            ImageView iv = new ImageView(this);
+            iv.setImageDrawable(new GlyphDrawable(it.glyph, Theme.GLYPH));
+            iv.setContentDescription(it.label);
+            int g = Math.min(px(Theme.GLYPH_SIZE), Math.min(grid.artW, grid.artH));
+            FrameLayout.LayoutParams glp = new FrameLayout.LayoutParams(g, g);
+            glp.gravity = Gravity.CENTER;
+            art.addView(iv, glp);
         }
         tile.addView(art, new LinearLayout.LayoutParams(grid.artW, grid.artH));
 
-        TextView label = new TextView(this);
+        final TextView label = new TextView(this);
         label.setText(it.label);
-        label.setTextColor(TEXT);
-        label.setTextSize(14);
+        label.setTextColor(Theme.TEXT_SOFT);
+        label.setTextSize(Theme.LABEL_SP);
+        label.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         label.setSingleLine(true);
         label.setEllipsize(TextUtils.TruncateAt.END);
-        label.setPadding(px(2), px(8), px(2), px(2));
+        label.setPadding(px(2), px(9), px(2), px(3));
         tile.addView(label, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // The only animation: a small lift on focus.
+        // The only animation: a small lift on focus, with the label brightening.
         tile.setOnFocusChangeListener(new View.OnFocusChangeListener() {
             @Override public void onFocusChange(View v, boolean focused) {
-                float s = focused ? 1.07f : 1f;
-                v.animate().scaleX(s).scaleY(s).setDuration(100).start();
-                v.setTranslationZ(focused ? px(8) : 0);
+                float s = focused ? Theme.FOCUS_SCALE : 1f;
+                v.animate().scaleX(s).scaleY(s).setDuration(110).start();
+                v.setTranslationZ(focused ? px(Theme.FOCUS_LIFT) : 0);
+                label.setTextColor(focused ? Theme.TEXT_FOCUS : Theme.TEXT_SOFT);
             }
         });
         tile.setOnClickListener(new View.OnClickListener() {
@@ -617,7 +706,7 @@ public class MainActivity extends Activity {
     private void showOptions(final Item it) {
         if (it.input || KEY_SETTINGS.equals(it.key) || KEY_HIDDEN.equals(it.key)) return;
         String[] options = { "Move to front", "Hide from home", "App info" };
-        new AlertDialog.Builder(this)
+        showStyled(new AlertDialog.Builder(this)
                 .setTitle(it.label)
                 .setItems(options, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) {
@@ -625,8 +714,7 @@ public class MainActivity extends Activity {
                         else if (which == 1) hide(it.key);
                         else openAppInfo(it.key);
                     }
-                })
-                .show();
+                }));
     }
 
     private void showHidden() {
@@ -634,14 +722,13 @@ public class MainActivity extends Activity {
         final List<Item> list = new ArrayList<Item>(hiddenItems);
         String[] names = new String[list.size()];
         for (int i = 0; i < names.length; i++) names[i] = list.get(i).label;
-        new AlertDialog.Builder(this)
-                .setTitle("Tap an app to show it again")
+        showStyled(new AlertDialog.Builder(this)
+                .setTitle("Choose an app to show again")
                 .setItems(names, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) {
                         unhide(list.get(which).key);
                     }
-                })
-                .show();
+                }));
     }
 
     private void pin(String key) {
@@ -689,11 +776,35 @@ public class MainActivity extends Activity {
         return g;
     }
 
+    /** Artwork card: a very soft top-to-bottom gradient so cards have depth on any background. */
+    private Drawable cardBackground() {
+        GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[] { Theme.CARD_TOP, Theme.CARD });
+        g.setCornerRadius(px(Theme.CARD_RADIUS));
+        return g;
+    }
+
+    /** Transparent normally; a plate with an accent ring when the tile has focus. */
     private Drawable focusBackground() {
         StateListDrawable s = new StateListDrawable();
         s.addState(new int[] { android.R.attr.state_focused },
-                rounded(0xFF2A3342, 12, ACCENT, 2));
+                rounded(Theme.CARD_FOCUSED, Theme.TILE_RADIUS, Theme.ACCENT, Theme.RING));
         s.addState(new int[] {}, new ColorDrawable(Color.TRANSPARENT));
         return s;
+    }
+
+    /** Shows a dialog with the launcher's rounded dark look and a stronger dim behind it. */
+    private void showStyled(AlertDialog.Builder builder) {
+        AlertDialog dialog = builder.create();
+        try {
+            Window w = dialog.getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(rounded(Theme.DIALOG_BG, Theme.DIALOG_RADIUS, Theme.STROKE, Theme.STROKE_W));
+                w.setDimAmount(0.65f);
+            }
+        } catch (Throwable ignored) {
+            // keep the default look rather than fail to show the dialog
+        }
+        dialog.show();
     }
 }

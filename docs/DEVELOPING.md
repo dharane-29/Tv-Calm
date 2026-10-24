@@ -14,6 +14,8 @@ app/
     Grid.java                    pure layout maths (columns, tile sizes)
     Order.java                   pure ordering/pinning helpers
     Scrim.java                   pure wallpaper-darkening maths
+    Theme.java                   every colour/size/type token (single source of truth for the look)
+    Glyph.java                   geometry of the HDMI / gear / hidden-eye icons (pure; drawn by MainActivity)
 tvcalm.py                        the toolkit: build, scan, debloat, tune, install, wallpaper, restore, undo, lockdown
 tests/
   run_all.py                     runs every test and prints an honest summary
@@ -23,12 +25,23 @@ tests/
   emulator_smoke.sh              end-to-end test against a real Android TV emulator
   smoke_lib.sh                   shell helpers for the smoke test (unit-tested)
   pngpx.py, ui_focus.py, pick_candidate.py   small helpers used by the smoke test
-docs/                            this guide, the testing guide, the test report, a preview image
+tools/
+  render_preview.py              draws the preview pictures from the real design values (needs Pillow, numpy, a JDK)
+  java/app/calmhome/PreviewData.java   exports Theme/Grid/Glyph/Scrim values as JSON for the renderer
+docs/                            this guide, the testing guide, the test report, preview images
 .github/workflows/               build-apk, emulator-smoke, windows-tests
 ```
 
 **Design rule:** anything that can be pure maths is kept out of `MainActivity` (no Android
-classes) so it can be unit-tested on a plain JVM. `Grid`, `Order` and `Scrim` follow that rule.
+classes) so it can be unit-tested on a plain JVM. `Grid`, `Order`, `Scrim`, `Theme` and `Glyph`
+follow that rule.
+
+**Changing the look.** Edit `Theme.java` (colours, sizes, type), never a literal inside
+`MainActivity`. `UnitTests` then checks the contrast of every text/background pair, that the
+dim label colours are no brighter than the one the wallpaper gradient guarantees, and that the
+lines and card gradients stay subtle. Then run `python tools/render_preview.py` and commit the
+refreshed pictures in `docs/`. The preview is a redraw, not a screenshot: look at a real
+emulator or TV before trusting spacing and fonts.
 
 ## Setting up a machine
 

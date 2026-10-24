@@ -316,6 +316,108 @@ public class UnitTests {
         check(Scrim.centerCrop(0, 0, 10, 10)[2] >= 1, "degenerate crop");
     }
 
+    // ----------------------------------------------------------------- Theme and Glyph
+    static double lum(int argb) { return Scrim.luminance(argb & 0xFFFFFF); }
+    static double ratio(int a, int b) { return Scrim.contrast(lum(a), lum(b)); }
+    static int over(int argb, int under) { return Scrim.blend(argb & 0xFFFFFF, ((argb >>> 24) & 255) / 255.0, under & 0xFFFFFF); }
+
+    static void themeTokens() {
+        // text is readable on every surface it appears on (WCAG AA is 4.5; large text 3)
+        check(ratio(Theme.TEXT_SOFT, Theme.BG) >= 7.0, "unfocused label on background");
+        check(ratio(Theme.TEXT_SOFT, Theme.CARD_FOCUSED) >= 7.0, "unfocused label on focus plate");
+        check(ratio(Theme.TEXT_FOCUS, Theme.CARD_FOCUSED) >= 10.0, "focused label on focus plate");
+        check(ratio(Theme.TEXT, Theme.BG) >= 12.0, "clock on background");
+        check(ratio(Theme.DIM, Theme.BG) >= 7.0, "section titles / date on background");
+        check(ratio(Theme.DIM, Theme.CARD) >= 4.5 && ratio(Theme.DIM, Theme.CARD_TOP) >= 4.5, "dim text on cards");
+        check(ratio(Theme.TEXT, Theme.DIALOG_BG) >= 10.0, "dialog text");
+        // The wallpaper scrim guarantees DIM_TEXT is readable; every other label colour is brighter.
+        check(lum(Theme.TEXT_SOFT) >= lum(Theme.DIM) && lum(Theme.TEXT_FOCUS) >= lum(Theme.TEXT_SOFT)
+                && lum(Theme.TEXT) >= lum(Theme.DIM), "all label colours are at least as bright as the guaranteed one");
+        // non-text parts need 3:1
+        check(ratio(Theme.ACCENT, Theme.BG) >= 3.0, "focus ring on background");
+        check(ratio(Theme.ACCENT, Theme.CARD_FOCUSED) >= 3.0, "focus ring on its own plate");
+        check(ratio(Theme.GLYPH, Theme.CARD) >= 3.0 && ratio(Theme.GLYPH, Theme.CARD_TOP) >= 3.0, "icons on cards");
+        // subtle lines: visible but never loud
+        double hair = ratio(over(Theme.HAIRLINE, Theme.BG), Theme.BG);
+        check(hair >= 1.1 && hair <= 2.0, "divider is visible but subtle (" + hair + ")");
+        double edge = ratio(over(Theme.STROKE, Theme.CARD), Theme.CARD);
+        check(edge >= 1.15 && edge <= 2.5, "card edge is visible but subtle (" + edge + ")");
+        double sheen = ratio(Theme.CARD_TOP, Theme.CARD);
+        check(sheen > 1.0 && sheen < 1.3, "card gradient is soft (" + sheen + ")");
+        // sizes: legible from a sofa, hierarchy preserved
+        check(Theme.LABEL_SP >= 14 && Theme.SECTION_SP >= 14 && Theme.DATE_SP >= 16 && Theme.AMPM_SP >= 16, "minimum text sizes");
+        check(Theme.CLOCK_SP > Theme.DATE_SP && Theme.DATE_SP >= Theme.LABEL_SP, "type hierarchy");
+        check(Theme.FOCUS_SCALE > 1.02f && Theme.FOCUS_SCALE < 1.12f, "focus lift is noticeable but contained");
+        check(Theme.TILE_RADIUS > Theme.CARD_RADIUS, "plate is rounder than the card it frames");
+        check(((Theme.STROKE >>> 24) & 255) > 0 && ((Theme.STROKE >>> 24) & 255) < 0x80, "stroke is translucent");
+        check(((Theme.HAIRLINE >>> 24) & 255) > 0 && ((Theme.HAIRLINE >>> 24) & 255) < 0x80, "hairline is translucent");
+    }
+
+    static int polyCount(Glyph.Prim p) { return p.p.length / 2; }
+
+    static boolean hasPoint(double[] pts, double x, double y) {
+        for (int i = 0; i + 1 < pts.length; i += 2) {
+            if (Math.abs(pts[i] - x) < 1e-6 && Math.abs(pts[i + 1] - y) < 1e-6) return true;
+        }
+        return false;
+    }
+
+    static void glyphGeometry() {
+        for (Glyph.Kind k : Glyph.Kind.values()) {
+            java.util.List<Glyph.Prim> shapes = Glyph.shapes(k);
+            check(!shapes.isEmpty(), k + " has shapes");
+            for (Glyph.Prim s : shapes) {
+                check(s.fill || s.width > 0, k + " strokes have a width");
+                check(s.width < 0.2, k + " strokes are not absurdly thick");
+                double lo = 1, hi = 0;
+                if (s.type == Glyph.POLY) {
+                    check(s.p.length % 2 == 0 && s.p.length >= 6, k + " polygon has >= 3 points");
+                    for (double v : s.p) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+                } else if (s.type == Glyph.CIRCLE) {
+                    check(s.p.length == 3 && s.p[2] > 0, k + " circle");
+                    lo = Math.min(s.p[0], s.p[1]) - s.p[2];
+                    hi = Math.max(s.p[0], s.p[1]) + s.p[2];
+                } else {
+                    check(s.p.length == 4, k + " line");
+                    for (double v : s.p) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+                }
+                check(lo >= 0.05 && hi <= 0.95, k + " shape stays inside the box (" + lo + ".." + hi + ")");
+                check(lo - s.width / 2 >= 0 && hi + s.width / 2 <= 1, k + " strokes are not clipped");
+            }
+        }
+        // Gear: 8 teeth => 32 vertices, with 8-fold rotational symmetry.
+        Glyph.Prim gear = Glyph.shapes(Glyph.Kind.SETTINGS).get(0);
+        check(gear.closed && polyCount(gear) == 32, "gear has 8 teeth");
+        for (int i = 0; i + 1 < gear.p.length; i += 2) {
+            double dx = gear.p[i] - 0.5, dy = gear.p[i + 1] - 0.5, a = Math.toRadians(45);
+            check(hasPoint(gear.p, 0.5 + dx * Math.cos(a) - dy * Math.sin(a), 0.5 + dx * Math.sin(a) + dy * Math.cos(a)),
+                    "gear is symmetric under a 45 degree turn");
+        }
+        // HDMI: connector + 9 evenly spaced pins; left/right mirror symmetric.
+        java.util.List<Glyph.Prim> hdmi = Glyph.shapes(Glyph.Kind.HDMI);
+        int pins = 0, lines = 0;
+        for (Glyph.Prim s : hdmi) if (s.type == Glyph.LINE) { lines++; if (Math.abs(s.p[1] - 0.43) < 1e-9) pins++; }
+        check(pins == 9 && lines == 9, "HDMI has nine pins and nothing else (no cable stub)");
+        double prevX = -1;
+        for (Glyph.Prim s : hdmi) {
+            if (s.type != Glyph.LINE) continue;
+            check(s.p[0] > prevX && (prevX < 0 || Math.abs(s.p[0] - prevX - 0.065) < 1e-9), "pins are evenly spaced");
+            check(Math.abs(s.p[0] - 0.5) <= 0.26 + 1e-9, "pins sit inside the connector body");
+            prevX = s.p[0];
+        }
+        Glyph.Prim body = hdmi.get(0);
+        for (int i = 0; i + 1 < body.p.length; i += 2) check(hasPoint(body.p, 1 - body.p[i], body.p[i + 1]), "HDMI body is mirror symmetric");
+        // Hidden: lens symmetric both ways, with a slash from lower-left to upper-right.
+        java.util.List<Glyph.Prim> eye = Glyph.shapes(Glyph.Kind.HIDDEN);
+        Glyph.Prim lens = eye.get(0);
+        for (int i = 0; i + 1 < lens.p.length; i += 2) {
+            check(hasPoint(lens.p, 1 - lens.p[i], lens.p[i + 1]), "eye is left/right symmetric");
+            check(hasPoint(lens.p, lens.p[i], 1 - lens.p[i + 1]), "eye is top/bottom symmetric");
+        }
+        Glyph.Prim slash = eye.get(2);
+        check(slash.type == Glyph.LINE && slash.p[0] < slash.p[2] && slash.p[1] > slash.p[3], "slash runs up and to the right");
+    }
+
     public static void main(String[] args) {
         gridSweep();
         pins();
@@ -326,6 +428,8 @@ public class UnitTests {
         scrimStops();
         scrimEndToEnd();
         scrimHelpers();
+        themeTokens();
+        glyphGeometry();
         System.out.println("Java unit tests passed (" + checks + " checks)");
     }
 }

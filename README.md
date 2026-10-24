@@ -14,6 +14,10 @@ Python 3.8+ standard library only; runs on Windows, macOS and Linux.
   **no permissions** (checked on every build). Most-used apps rise to the top. Long-press OK
   (or Menu) on an app: move to front, hide, App info. Hidden apps are always recoverable, and
   a Settings tile is always present. Targets Android 5.0 (API 21) and newer.
+- **A finished look:** rounded cards with soft gradients and hairline edges, drawn HDMI /
+  settings / hidden icons, section headers with counts and dividers, a lifted focus state with
+  a ring, shadow and brightened label, rows that fade as they scroll away, and dark rounded
+  dialogs. Every colour and size lives in one file (`Theme.java`) with contrast tests.
 - **Your own wallpaper** (optional): a JPG/PNG/WebP behind the apps with a soft dark gradient.
   The launcher measures how bright each part of the picture is and darkens just enough to keep
   labels readable.
@@ -39,7 +43,21 @@ Python 3.8+ standard library only; runs on Windows, macOS and Linux.
 For a first run on a real TV, follow the cautious order in
 [docs/TESTING.md](docs/TESTING.md#9-before-you-trust-it-on-a-physical-tv).
 
+## How it looks
+
+![Calm Home on a plain background](docs/ui-preview.png)
+![Calm Home over a wallpaper](docs/ui-preview-wallpaper.png)
+
+> **These are renderings, not screenshots.** `tools/render_preview.py` redraws the screen from
+> the app's real design values (colours, sizes, grid maths, icon geometry, wallpaper gradient
+> are read from the Java classes), so it stays honest as the design changes. What a real TV
+> adds or changes: each app's own banner artwork (placeholders here), the TV's Roboto font
+> (Noto Sans here), and Android's own anti-aliasing and shadow rendering. Regenerate with
+> `python tools/render_preview.py` (needs a JDK, Pillow and numpy).
+
 ## Wallpaper
+
+A very bright picture is the hard case. Left: used as-is. Right: with Calm Home's gradient.
 
 ![Wallpaper preview](docs/wallpaper-preview.jpg)
 
@@ -74,13 +92,14 @@ Full detail: [docs/TESTING.md](docs/TESTING.md) and
 
 | Area | Status |
 | --- | --- |
-| Java unit tests (layout, sorting, wallpaper maths) | **Passed**: 220,263 checks (Windows 11 session, and Linux) |
-| Python tests against a simulated TV (88 tests, including the smoke script run against a simulated device) | **Passed on Linux**, in two output modes, 0 skipped. **Skipped on native Windows in the 20 Oct 2026 session**; since made portable but **not yet re-run on Windows** |
+| Java unit tests (layout, sorting, wallpaper maths, design tokens, icon geometry) | **Passed**: 220,263 checks in the Windows 11 session; 220,516 now on Linux (design-token and icon tests were added since) |
+| Python tests against a simulated TV (91 tests, including the smoke script run against a simulated device) | **Passed on Linux**, in two output modes, 0 skipped. **Skipped on native Windows in the 20 Oct 2026 session**; since made portable but **not yet re-run on Windows** |
 | APK build, signing, zero permissions | **Passed** (Windows 11 and Linux) |
 | Android 14 TV emulator: install, takeover, scan, dry run, tune + restore, launch, wallpaper (screen pixels), undo, recovery | **Passed** (Windows 11 + Git Bash, 20 Oct 2026, with the scripts as they were then) |
 | Emulator: options dialog from the Menu key | **Not exercised** in that session. The smoke script now looks for an app tile; its logic passed against a simulated device (Linux), but it has **not been re-run on a real emulator** |
 | Emulator: applying debloat | **Not exercised** (dry run only). Optional `SMOKE_DEBLOAT=1` step added; passed against a simulated device only |
 | Updated smoke script on a real emulator / in Git Bash | **Not yet run** (only against a simulated device on Linux) |
+| The polished UI (new header, tiles, icons, dialogs) on a real screen | **Not yet seen on any device.** It compiles for Android 5-11 and its design values are unit-tested; the pictures above are renderings |
 | **Any physical TV (including TCL)** | **Not tested** |
 | Performance (speed, memory savings) | **Not measured**; no performance claim is made |
 

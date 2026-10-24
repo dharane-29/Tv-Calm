@@ -104,13 +104,19 @@ def die(msg: str, code: int = 1):
 
 def run(args, timeout=120):
     try:
-        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout)
+        # Capture raw bytes and clean up ourselves. Text mode would first turn "\r\r\n"
+        # (which some adb versions print on Windows) into TWO line breaks, leaving blank
+        # lines that break parsing; removing every "\r" first avoids that.
+        p = subprocess.run(args, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 124, "", "timed out"
     except FileNotFoundError:
         return 127, "", f"{args[0]} not found"
-    return p.returncode, p.stdout.replace("\r", "").strip(), p.stderr.replace("\r", "").strip()
+
+    def clean(b):
+        return b.decode("utf-8", errors="replace").replace("\r", "").strip()
+
+    return p.returncode, clean(p.stdout), clean(p.stderr)
 
 
 def ask(prompt: str) -> bool:

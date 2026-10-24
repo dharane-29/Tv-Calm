@@ -23,7 +23,7 @@ def java_tests():
     if not (shutil.which("javac") and shutil.which("java")):
         return "SKIP", "no JDK (javac/java) on PATH"
     out = tempfile.mkdtemp()
-    src = [str(ROOT / "app/src/app/calmhome" / n) for n in ("Grid.java", "Order.java", "Scrim.java")]
+    src = [str(ROOT / "app/src/app/calmhome" / n) for n in ("Grid.java", "Order.java", "Scrim.java", "Theme.java", "Glyph.java")]
     src.append(str(ROOT / "tests/java/app/calmhome/UnitTests.java"))
     detail = ""
     for cmd in (["javac", "-Xlint:-options", "--release", "8", "-d", out, *src],

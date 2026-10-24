@@ -951,6 +951,64 @@ class TestSmokeScript(unittest.TestCase):
         self.assertEqual(json.loads(self.state.read_text())["disabled"], [])      # fully restored
 
 
+@unittest.skipUnless(shutil.which("javac") and shutil.which("java"), "needs a JDK")
+class TestPreviewData(unittest.TestCase):
+    """tools/render_preview.py draws the preview from numbers exported by the real Java classes."""
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        cls.out = Path(tempfile.mkdtemp())
+        src = ROOT / "app" / "src" / "app" / "calmhome"
+        files = [str(src / n) for n in ("Grid.java", "Scrim.java", "Theme.java", "Glyph.java")]
+        files.append(str(ROOT / "tools" / "java" / "app" / "calmhome" / "PreviewData.java"))
+        r = subprocess.run(["javac", "--release", "8", "-Xlint:-options", "-d", str(cls.out), *files],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+    def export(self, *args):
+        import subprocess
+        r = subprocess.run(["java", "-cp", str(self.out), "app.calmhome.PreviewData", *args],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_1080p_layout_matches_the_documentation(self):
+        d = self.export("1920", "2.0")
+        self.assertEqual(d["grid"], {"cols": 5, "tileW": 319, "artW": 295, "artH": 165})
+        self.assertNotIn("stops", d)
+
+    def test_every_design_value_is_exported(self):
+        d = self.export("1920", "2.0")
+        for key in ("BG", "CARD_TOP", "CARD", "CARD_FOCUSED", "STROKE", "HAIRLINE", "ACCENT", "TEXT",
+                    "TEXT_SOFT", "TEXT_FOCUS", "DIM", "GLYPH"):
+            self.assertRegex(d["colors"][key], r"^#[0-9A-F]{8}$", key)
+        self.assertEqual(sorted(d["glyphs"]), ["HDMI", "HIDDEN", "SETTINGS"])
+        self.assertGreater(d["sizes"]["FOCUS_SCALE"], 1.0)
+
+    def test_gradient_stops_for_a_picture(self):
+        px = self.out / "px.txt"
+        px.write_text("2 2\n" + " ".join([str((0xFF << 24) | (200 << 16) | (40 << 8) | 40)] * 4))
+        d = self.export("1920", "2.0", str(px), "50")
+        self.assertEqual(len(d["stops"]), 9)
+        self.assertTrue(all(0 < v <= 0.95 for v in d["stops"]))
+        self.assertAlmostEqual(d["stops"][4], 0.62, places=2)    # the value that matched the real emulator pixel
+
+
+class TestRunLineEndings(unittest.TestCase):
+    """Windows adb output can end lines with \\r\\n or even \\r\\r\\n. run() must turn every
+    variant into plain lines with NO blank lines in between (blank lines broke parsing)."""
+
+    def _run_bytes(self, payload):
+        code = "import sys; sys.stdout.buffer.write(%r)" % payload
+        return tvcalm.run([sys.executable, "-c", code])
+
+    def test_lf_crlf_and_double_cr_all_give_the_same_lines(self):
+        for payload in (b"a\nb\nc\n", b"a\r\nb\r\nc\r\n", b"a\r\r\nb\r\r\nc\r\r\n"):
+            rc, out, err = self._run_bytes(payload)
+            self.assertEqual((rc, out, err), (0, "a\nb\nc", ""), payload)
+
+
 class TestCli(unittest.TestCase):
     def test_help_and_errors(self):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
