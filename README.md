@@ -21,9 +21,18 @@ Python 3.8+ standard library only; runs on Windows, macOS and Linux.
 - **Your own wallpaper** (optional): a JPG/PNG/WebP behind the apps with a soft dark gradient.
   The launcher measures how bright each part of the picture is and darkens just enough to keep
   labels readable.
-- **`tvcalm.py`**: build, scan, debloat, tune, install, wallpaper, restore, undo, lockdown.
+- **A step-by-step menu** (`guide.py`): no commands to type. It asks which TV, then offers
+  check, install, wallpaper, clean up apps, speed tweaks, undo and finish as numbered choices.
+  It finds `adb` and the Java that comes with Android Studio by itself.
+- **`tvcalm.py`**: build, scan, debloat, tune, install, wallpaper, restore, undo, lockdown
+  (the menu uses these, so every safety rule below applies to it too).
 
 ## Quick start
+
+**Easiest way: the menu.** On Windows double-click `TV-Calm.bat` (on macOS/Linux run
+`./tv-calm.sh`; or run `python tvcalm.py` with no arguments). Do the TV setup in step 1 below,
+then follow the numbered choices: build the app file (8), check your TV (1), install (2), and
+only then the rest. Prefer typing commands? Steps 2 onwards below do the same thing.
 
 1. On the TV: Settings > Device Preferences > About > press **Build** 7 times, then Developer
    options > turn on **USB/network debugging**. Install `adb` (Android platform-tools) on your
@@ -93,7 +102,8 @@ Full detail: [docs/TESTING.md](docs/TESTING.md) and
 | Area | Status |
 | --- | --- |
 | Java unit tests (layout, sorting, wallpaper maths, design tokens, icon geometry) | **Passed**: 220,263 checks in the Windows 11 session; 220,516 now on Linux (design-token and icon tests were added since) |
-| Python tests against a simulated TV (91 tests, including the smoke script run against a simulated device) | **Passed on Linux**, in two output modes, 0 skipped. **Skipped on native Windows in the 20 Oct 2026 session**; since made portable but **not yet re-run on Windows** |
+| Python tests against a simulated TV (123 tests, including the smoke script run against a simulated device, the step-by-step menu, and adb/Java discovery) | **Passed on Linux**, in two output modes. **Passed on native Windows** in the 25 Oct 2026 run of the previous 92 tests (the Java and bash-based ones were skipped there because the JDK and bash were not on PATH); the 31 newer tests have not been run on Windows yet |
+| `TV-Calm.bat` double-click launcher | **Not run on Windows yet**: only its line endings and contents are checked by a test; `tv-calm.sh` is tested on Linux |
 | APK build, signing, zero permissions | **Passed** (Windows 11 and Linux) |
 | Android 14 TV emulator: install, takeover, scan, dry run, tune + restore, launch, wallpaper (screen pixels), undo, recovery | **Passed** (Windows 11 + Git Bash, 20 Oct 2026, with the scripts as they were then) |
 | Emulator: options dialog from the Menu key | **Not exercised** in that session. The smoke script now looks for an app tile; its logic passed against a simulated device (Linux), but it has **not been re-run on a real emulator** |

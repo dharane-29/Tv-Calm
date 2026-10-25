@@ -17,6 +17,8 @@ app/
     Theme.java                   every colour/size/type token (single source of truth for the look)
     Glyph.java                   geometry of the HDMI / gear / hidden-eye icons (pure; drawn by MainActivity)
 tvcalm.py                        the toolkit: build, scan, debloat, tune, install, wallpaper, restore, undo, lockdown
+guide.py                         the step-by-step menu: asks questions, then calls the tvcalm.py functions
+TV-Calm.bat, tv-calm.sh          double-click / shell launchers that run `tvcalm.py` (no arguments = the menu)
 tests/
   run_all.py                     runs every test and prints an honest summary
   test_tvcalm.py                 Python tests against a simulated TV
@@ -143,3 +145,18 @@ If a local working copy and the GitHub branch have drifted, do not assume either
 authoritative. Compare them (`git fetch`, then `git diff origin/main -- tests/`), check what
 each version of `tests/emulator_smoke.sh`, `tests/run_all.py` and `tests/test_tvcalm.py` does,
 and merge deliberately. Never delete or weaken a test to make a run look cleaner.
+
+## The step-by-step menu
+
+`guide.py` must stay a thin layer: it asks questions and calls `cmd_*` functions with a
+`Namespace`, so the safety rules above are never bypassed. Two things to keep:
+
+* Every error must come back to the menu (`guarded()` catches `SystemExit`), never close the window.
+* It reads answers with `input()` and prints with `print()`, so `TestGuide` can drive a whole
+  session with scripted answers against the simulated TV. `session()` fails if answers are left
+  over, which catches menu flows that changed.
+
+`find_adb()` and `ensure_jdk()` look in the usual install folders (the default Android SDK,
+JAVA_HOME, Android Studio's bundled JDK) so a beginner never has to edit PATH. Tests that must
+see "adb not found" hide those folders by pointing HOME, USERPROFILE and LOCALAPPDATA at an
+empty directory.

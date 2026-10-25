@@ -42,8 +42,8 @@ Expected ending (example from the author's Linux environment):
 ```text
 ==================== SUMMARY ====================
 PASS  Java unit tests: Java unit tests passed (220516 checks)
-PASS  Python tests, normal adb output: 91 tests, 0 skipped
-PASS  Python tests, Windows-style CRLF adb output: 91 tests, 0 skipped
+PASS  Python tests, normal adb output: 123 tests, 0 skipped
+PASS  Python tests, Windows-style CRLF adb output: 123 tests, 0 skipped
 =================================================
 RESULT: PASSED
 ```

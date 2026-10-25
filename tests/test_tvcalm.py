@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 import tvcalm  # noqa: E402
+import guide  # noqa: E402
 
 IP = "192.168.1.50"
 
@@ -122,6 +123,8 @@ class TestConnection(Base):
         os.environ["PATH"] = str(self.tmp / "empty")
         os.environ.pop("ANDROID_HOME", None)
         os.environ.pop("ANDROID_SDK_ROOT", None)
+        for key in ("HOME", "USERPROFILE", "LOCALAPPDATA"):      # hide any real Android SDK
+            os.environ[key] = str(self.tmp / "nohome")
         code, out, err = self.tv("scan", IP)
         self.assertNotEqual(code, 0)
         self.assertIn("adb not found", err)
@@ -1007,6 +1010,264 @@ class TestRunLineEndings(unittest.TestCase):
         for payload in (b"a\nb\nc\n", b"a\r\nb\r\nc\r\n", b"a\r\r\nb\r\r\nc\r\r\n"):
             rc, out, err = self._run_bytes(payload)
             self.assertEqual((rc, out, err), (0, "a\nb\nc", ""), payload)
+
+
+class TestDiscovery(Base):
+    """adb and a JDK are found in the usual places, so the user needn't edit PATH by hand."""
+
+    def _isolate(self):
+        os.environ.pop("TVCALM_ADB", None)
+        os.environ.pop("ANDROID_HOME", None)
+        os.environ.pop("ANDROID_SDK_ROOT", None)
+        os.environ.pop("JAVA_HOME", None)
+        for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            os.environ.pop(key, None)
+        os.environ["PATH"] = str(self.tmp / "empty")
+        os.environ["HOME"] = os.environ["USERPROFILE"] = str(self.tmp / "home")
+
+    def _fake_tools(self, folder, names):
+        folder.mkdir(parents=True)
+        for n in names:
+            for variant in (n, n + ".exe"):
+                f = folder / variant
+                f.write_bytes(b"")
+                f.chmod(0o755)
+
+    def test_adb_found_in_the_default_sdk_folder(self):
+        self._isolate()
+        self._fake_tools(self.tmp / "home" / "Android" / "Sdk" / "platform-tools", ["adb"])
+        found = tvcalm.find_adb()
+        self.assertEqual(Path(found[0]).parent, self.tmp / "home" / "Android" / "Sdk" / "platform-tools")
+
+    def test_jdk_found_through_java_home(self):
+        self._isolate()
+        self._fake_tools(self.tmp / "jdk" / "bin", ["javac", "keytool"])
+        os.environ["JAVA_HOME"] = str(self.tmp / "jdk")
+        self.assertTrue(tvcalm.ensure_jdk())
+        self.assertTrue(os.environ["PATH"].startswith(str(self.tmp / "jdk" / "bin")))
+
+    def test_jdk_found_in_android_studio_folder(self):
+        self._isolate()
+        base = self.tmp / "pf"
+        self._fake_tools(base / "Android" / "Android Studio" / "jbr" / "bin", ["javac", "keytool"])
+        os.environ["ProgramFiles"] = str(base)
+        self.assertTrue(tvcalm.ensure_jdk())
+
+    def test_no_jdk_anywhere_is_reported(self):
+        self._isolate()
+        backup, tvcalm._jdk_homes = tvcalm._jdk_homes, (lambda: [])
+        try:
+            self.assertFalse(tvcalm.ensure_jdk())
+        finally:
+            tvcalm._jdk_homes = backup
+
+
+class TestGuide(Base):
+    """The step-by-step menu, driven by scripted answers against the simulated TV."""
+
+    def setUp(self):
+        super().setUp()
+        self.init(takeover="direct")
+        self.root_backup, tvcalm.ROOT = tvcalm.ROOT, self.tmp / "root"
+        (tvcalm.ROOT / "out").mkdir(parents=True)
+        tvcalm.time.sleep, self._sleep = (lambda s: None), tvcalm.time.sleep
+
+    def tearDown(self):
+        tvcalm.ROOT = self.root_backup
+        tvcalm.time.sleep = self._sleep
+        super().tearDown()
+
+    def session(self, *answers):
+        """Run the menu with these answers. Every answer must be used, none missing."""
+        self.answers = list(answers)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            guide.run(tvcalm)
+        self.assertEqual(self.answers, [], "answers were left over")
+        return out.getvalue()
+
+    def make_apk(self):
+        (tvcalm.ROOT / "out" / "calmhome.apk").write_bytes(b"not-a-real-apk")
+
+    def set_state(self, **kw):
+        st = self.st()
+        st.update(kw)
+        self.state.write_text(json.dumps(st))
+
+    def picture(self, name="space.png"):
+        p = self.tmp / name
+        p.write_bytes(make_png(1920, 1080))
+        return str(p)
+
+    def wall(self):
+        return self.st().get("files", {})
+
+    # --- menu basics
+    def test_menu_shows_connection_and_status(self):
+        out = self.session("", "q")
+        self.assertIn("connected to", out)
+        self.assertIn("Calm Home: not installed", out)
+        self.assertIn("App file: not built yet", out)
+
+    def test_unknown_choice_is_explained(self):
+        out = self.session("", "x", "q")
+        self.assertIn("Please type one of the numbers shown.", out)
+
+    def test_check_only_looks(self):
+        before = self.st()
+        out = self.session("", "1", "", "q")
+        self.assertIn("Nothing was changed", out)
+        self.assertEqual(self.st(), before)
+
+    def test_running_with_no_arguments_opens_the_menu(self):
+        self.answers = ["", "q"]
+        code, out, err = self.tv()
+        self.assertEqual(code, 0)
+        self.assertIn("TV Calm", out)
+        self.assertEqual(self.answers, [])
+
+    # --- connecting
+    def test_cannot_connect_then_quit(self):
+        self.init(adb_off=True)
+        out = self.session("10.9.9.9", "q")
+        self.assertIn("I couldn't connect", out)
+        self.assertNotIn("Choose a number", out)
+
+    def test_adb_missing_is_explained_and_exits_cleanly(self):
+        os.environ.pop("TVCALM_ADB", None)
+        os.environ["PATH"] = str(self.tmp / "empty")
+        for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            os.environ.pop(key, None)
+        for key in ("HOME", "USERPROFILE", "LOCALAPPDATA"):
+            os.environ[key] = str(self.tmp / "nohome")
+        out = self.session()
+        self.assertIn("SDK Manager", out)
+
+    def test_last_tv_is_remembered(self):
+        self.session("192.168.1.50", "q")
+        saved = json.loads((tvcalm.STATE / "config.json").read_text())
+        self.assertEqual(saved["target"], "192.168.1.50")
+        self.init(adb_off=True)
+        out = self.session("q")
+        self.assertIn("192.168.1.50", out)
+        self.assertIn("the one you used last time", out)
+
+    # --- install
+    def test_install(self):
+        self.make_apk()
+        out = self.session("", "2", "y", "", "q")
+        self.assertTrue(self.st()["installed"])
+        self.assertIn("press Home", out)
+
+    def test_install_can_be_declined(self):
+        self.make_apk()
+        self.session("", "2", "n", "", "q")
+        self.assertFalse(self.st()["installed"])
+
+    def test_install_without_app_file_offers_to_build(self):
+        out = self.session("", "2", "n", "", "q")
+        self.assertIn("isn't built yet", out)
+        self.assertFalse(self.st()["installed"])
+
+    # --- wallpaper
+    def test_wallpaper_needs_calm_home(self):
+        out = self.session("", "3", "", "q")
+        self.assertIn("Install Calm Home first", out)
+
+    def test_wallpaper_with_dragged_quoted_path_and_dim(self):
+        self.set_state(installed=True)
+        out = self.session("", "3", '"' + self.picture() + '"', "70", "", "q")
+        self.assertIn("wallpaper is set", out)
+        self.assertEqual([v for k, v in self.wall().items() if k.endswith("wallpaper.cfg")], ["cfg:70"])
+
+    def test_wallpaper_default_dim_with_enter(self):
+        self.set_state(installed=True)
+        self.session("", "3", self.picture(), "", "", "q")
+        self.assertEqual([v for k, v in self.wall().items() if k.endswith("wallpaper.cfg")], ["cfg:40"])
+
+    def test_wallpaper_bad_dim_falls_back_to_default(self):
+        self.set_state(installed=True)
+        out = self.session("", "3", self.picture(), "abc", "", "q")
+        self.assertIn("so I'll use 40", out)
+        self.assertEqual([v for k, v in self.wall().items() if k.endswith("wallpaper.cfg")], ["cfg:40"])
+
+    def test_wallpaper_missing_file(self):
+        self.set_state(installed=True)
+        out = self.session("", "3", str(self.tmp / "nope.jpg"), "", "q")
+        self.assertIn("I can't find a file", out)
+        self.assertEqual(self.wall(), {})
+
+    def test_wallpaper_remove(self):
+        self.set_state(installed=True)
+        self.session("", "3", self.picture(), "", "", "q")
+        self.assertTrue(self.wall())
+        self.session("", "3", "remove", "", "q")
+        self.assertFalse([k for k in self.wall() if k.endswith("wallpaper.img")])
+
+    def test_clean_path_forms(self):
+        self.assertEqual(guide.clean_path('  "C:\\a b\\p.jpg" '), "C:\\a b\\p.jpg")
+        self.assertEqual(guide.clean_path("& 'C:\\x.jpg'"), "C:\\x.jpg")
+        self.assertEqual(guide.clean_path("/tmp/x.png"), "/tmp/x.png")
+
+    # --- clean up, tweaks, undo
+    def test_cleanup_declined_changes_nothing(self):
+        self.session("", "4", "n", "", "q")
+        self.assertEqual(self.st()["disabled"], [])
+
+    def test_cleanup_one_app_then_stop(self):
+        self.session("", "4", "y", "y", "q", "", "q")
+        self.assertEqual(len(self.st()["disabled"]), 1)
+
+    def test_tweaks_show_the_plan_and_can_be_declined(self):
+        before = self.st()["settings"]
+        out = self.session("", "5", "n", "", "q")
+        self.assertIn("->", out)
+        self.assertEqual(self.st()["settings"], before)
+
+    def test_tweaks_then_undo(self):
+        before = dict(self.st()["settings"])
+        self.session("", "5", "y", "", "q")
+        self.assertNotEqual(self.st()["settings"], before)
+        self.session("", "6", "a", "", "q")
+        self.assertEqual(self.st()["settings"].get("global.window_animation_scale"), "1.0")
+        self.assertEqual(self.st()["settings"].get("system.screen_off_timeout"), "600000")
+
+    def test_undo_removes_calm_home(self):
+        self.set_state(installed=True)
+        self.session("", "6", "b", "", "q")
+        self.assertFalse(self.st()["installed"])
+
+    def test_undo_menu_can_be_skipped(self):
+        self.set_state(installed=True)
+        self.session("", "6", "", "", "q")
+        self.assertTrue(self.st()["installed"])
+
+    # --- finishing
+    def test_lockdown_turns_debugging_off_and_leaves(self):
+        out = self.session("", "7", "y")
+        self.assertTrue(self.st()["scenario"]["adb_off"] or "ADB is off" in out)
+        self.assertIn("can't reach the TV any more", out)
+
+    def test_lockdown_can_be_declined(self):
+        out = self.session("", "7", "n", "", "q")
+        self.assertNotIn("can't reach the TV", out)
+
+
+class TestLaunchers(unittest.TestCase):
+    def test_bat_file_has_windows_line_endings_and_hands_over_to_tvcalm(self):
+        data = (ROOT / "TV-Calm.bat").read_bytes()
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""), "every line must end in CRLF")
+        text = data.decode()
+        self.assertIn("tvcalm.py %*", text)
+        self.assertIn("pause", text)             # the window must stay open so errors can be read
+        self.assertIn('cd /d "%~dp0"', text)     # works wherever the folder is
+
+    @unittest.skipUnless(shutil.which("bash") and os.name != "nt", "needs bash on macOS/Linux")
+    def test_sh_launcher_passes_arguments_on(self):
+        import subprocess
+        r = subprocess.run(["bash", str(ROOT / "tv-calm.sh"), "--help"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("guide", r.stdout)
 
 
 class TestCli(unittest.TestCase):

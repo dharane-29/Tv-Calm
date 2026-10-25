@@ -4,6 +4,7 @@
 Python 3.8+, standard library only. Works on Windows, macOS and Linux.
 Needs `adb` (Android platform-tools) on your PATH or in ANDROID_HOME.
 
+  python tvcalm.py                             open the step-by-step menu (easiest; no typing of commands)
   python tvcalm.py build                       build the launcher APK (needs JDK 17 + Android SDK)
   python tvcalm.py scan     <tv-ip>            read-only audit, changes nothing
   python tvcalm.py install  <tv-ip>            install the launcher, optionally make it default
@@ -144,15 +145,15 @@ def find_adb() -> list:
     found = shutil.which("adb")
     if found:
         return [found]
-    for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
-        base = os.environ.get(env)
-        if base:
-            for name in ("adb", "adb.exe"):
-                c = Path(base) / "platform-tools" / name
-                if c.exists():
-                    return [str(c)]
+    sdk = locate_sdk()      # ANDROID_HOME, or the folder Android Studio installs the SDK into
+    if sdk:
+        for name in ("adb", "adb.exe"):
+            c = sdk / "platform-tools" / name
+            if c.exists():
+                return [str(c)]
     die("adb not found. Install Android platform-tools "
-        "(https://developer.android.com/tools/releases/platform-tools) and retry.")
+        "(https://developer.android.com/tools/releases/platform-tools), or in Android Studio: "
+        "Tools > SDK Manager > SDK Tools > Android SDK Platform-Tools. Then retry.")
 
 
 class TV:
@@ -688,6 +689,39 @@ def cmd_lockdown(a):
 
 # ------------------------------------------------------------------------ build
 
+def _jdk_homes():
+    """Places a JDK commonly lives, newest-looking first. Android Studio ships one (jbr)."""
+    homes = []
+    if os.environ.get("JAVA_HOME"):
+        homes.append(Path(os.environ["JAVA_HOME"]))
+    for key in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(key)
+        if not base:
+            continue
+        b = Path(base)
+        homes.append(b / "Android" / "Android Studio" / "jbr")
+        for vendor in ("Eclipse Adoptium", "Java", "Microsoft", "Amazon Corretto", "Zulu"):
+            homes += sorted((b / vendor).glob("*"), reverse=True)
+    if os.environ.get("LOCALAPPDATA"):
+        homes.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Android Studio" / "jbr")
+    homes += [Path("/Applications/Android Studio.app/Contents/jbr/Contents/Home"),
+              Path("/opt/android-studio/jbr"), Path.home() / "android-studio" / "jbr"]
+    return homes
+
+
+def ensure_jdk() -> bool:
+    """True if javac and keytool can be run. If they are not on PATH, look in the usual places
+    (including the JDK that comes with Android Studio) and add the first one found to PATH."""
+    if shutil.which("javac") and shutil.which("keytool"):
+        return True
+    for home in _jdk_homes():
+        b = home / "bin"
+        if all((b / n).exists() or (b / (n + ".exe")).exists() for n in ("javac", "keytool")):
+            os.environ["PATH"] = str(b) + os.pathsep + os.environ.get("PATH", "")
+            return bool(shutil.which("javac") and shutil.which("keytool"))
+    return False
+
+
 def locate_sdk():
     """The Android SDK folder, or None."""
     for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
@@ -732,8 +766,9 @@ def cmd_build(a):
     if not bts or not plats:
         die("Install an Android SDK platform and build-tools (sdkmanager 'platforms;android-34' 'build-tools;34.0.0').")
     bt, jar = bts[-1], plats[-1] / "android.jar"
-    if not shutil.which("javac") or not shutil.which("keytool"):
-        die("JDK 17+ (javac, keytool) not found on PATH.")
+    if not ensure_jdk():
+        die("JDK 17+ (javac, keytool) not found. Android Studio includes one; if this still "
+            "fails, install Temurin 17 from adoptium.net and tick 'Add to PATH'.")
 
     work, out = ROOT / "build", ROOT / "out"
     shutil.rmtree(work, ignore_errors=True)
@@ -783,7 +818,17 @@ def cmd_build(a):
 
 # ------------------------------------------------------------------------- main
 
+def cmd_guide(a):
+    sys.path.insert(0, str(ROOT))
+    import guide
+    guide.run(sys.modules[__name__])
+
+
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["guide"]            # double-click / plain `python tvcalm.py` opens the menu
     p = argparse.ArgumentParser(prog="tvcalm", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -794,6 +839,7 @@ def main(argv=None):
         sp.set_defaults(fn=fn)
         return sp
 
+    add("guide", cmd_guide, target=False, help="step-by-step menu (also what runs with no arguments)")
     add("build", cmd_build, target=False, help="build out/calmhome.apk")
     s = add("scan", cmd_scan, help="read-only audit")
     s.add_argument("--top", type=int, default=25)
